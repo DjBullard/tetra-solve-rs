@@ -27,7 +27,7 @@ def convert_to_serializable(obj):
     return obj
 
 
-def extract_properties(database_path, output_path):
+def convert_database(database_path, output_path):
     print(f"Loading database from: {database_path}")
 
     if not os.path.exists(database_path):
@@ -39,6 +39,11 @@ def extract_properties(database_path, output_path):
         # Create a dictionary of the arrays so we can modify it
         output_arrays = dict(data)
 
+        # Convert pattern_largest_edge (if included) to float32s
+        if "pattern_largest_edge" in output_arrays:
+            output_arrays["pattern_largest_edge"] = output_arrays["pattern_largest_edge"].astype(np.float32)
+
+        # Convert properties to json
         if "props_packed" not in output_arrays:
             print("Error: 'props_packed' key not found in the .npz file.")
             return
@@ -136,6 +141,7 @@ def extract_properties(database_path, output_path):
         # Serialize to JSON string
         serializable_props = convert_to_serializable(db_props)
         json_str = json.dumps(serializable_props, indent=4)
+        json_str = json_str.replace('NaN', 'null')
 
         # REMOVE the old props_packed from the arrays to be saved via numpy
         del output_arrays["props_packed"]
@@ -173,4 +179,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    extract_properties(database_path=args.input, output_path=args.output)
+    convert_database(database_path=args.input, output_path=args.output)
