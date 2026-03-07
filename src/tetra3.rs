@@ -90,7 +90,7 @@ pub struct Solution {
 // --- Math & Projection Helpers ---
 
 fn angle_from_distance(dist: f64) -> f64 {
-    2.0 * (0.5 * dist).asin()
+    2.0 * (0.5 * dist).clamp(-1.0, 1.0).asin()
 }
 
 fn distance_from_angle(angle: f64) -> f64 {
@@ -183,7 +183,7 @@ fn distort_centroids(centroids: &Array2<f64>, height: f64, width: f64, k: f64, t
         let mut r_dist = r_undist;
         for _ in 0..maxiter {
             let r_undist_est = r_dist * (1.0 - kp * r_dist.powi(2)) / (1.0 - k);
-            let dru_drd = (1.0 - 2.0 * kp * r_dist) / (1.0 - k); // Strictly match Python tetra3.py
+            let dru_drd = (1.0 - 2.0 * kp * r_dist) / (1.0 - k);
             let error = r_undist - r_undist_est;
             r_dist += error / dru_drd;
             if error.abs() < tol { break; }
@@ -239,7 +239,6 @@ fn find_centroid_matches(image_centroids: &Array2<f64>, catalog_centroids: &Arra
         }
     }
     
-    // matches = matches[np.unique(matches[:, 1], return_index=True)[1], :]
     let mut unique_col1 = std::collections::BTreeMap::new();
     for (idx, &(_, j)) in matches.iter().enumerate() {
         unique_col1.entry(j).or_insert(idx);
@@ -247,7 +246,6 @@ fn find_centroid_matches(image_centroids: &Array2<f64>, catalog_centroids: &Arra
     let indices1: Vec<usize> = unique_col1.values().cloned().collect();
     let matches1: Vec<(usize, usize)> = indices1.into_iter().map(|idx| matches[idx]).collect();
 
-    // matches = matches[np.unique(matches[:, 0], return_index=True)[1], :]
     let mut unique_col0 = std::collections::BTreeMap::new();
     for (idx, &(i, _)) in matches1.iter().enumerate() {
         unique_col0.entry(i).or_insert(idx);
@@ -350,7 +348,10 @@ impl Tetra3 {
 
         let read_1d_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<f32>> {
             arc.by_name(name).ok().and_then(|mut zf| {
-                let npy = NpyFile::new(&mut zf).ok()?;
+                let mut buf = Vec::new();
+                zf.read_to_end(&mut buf).ok()?;
+                let mut cursor = Cursor::new(&buf);
+                let npy = NpyFile::new(&mut cursor).ok()?;
                 let data: Vec<f32> = npy.into_vec().ok()?;
                 Some(Array1::from_vec(data))
             })
@@ -358,7 +359,10 @@ impl Tetra3 {
         
         let read_1d_u16 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<u16>> {
             arc.by_name(name).ok().and_then(|mut zf| {
-                let npy = NpyFile::new(&mut zf).ok()?;
+                let mut buf = Vec::new();
+                zf.read_to_end(&mut buf).ok()?;
+                let mut cursor = Cursor::new(&buf);
+                let npy = NpyFile::new(&mut cursor).ok()?;
                 let data: Vec<u16> = npy.into_vec().ok()?;
                 Some(Array1::from_vec(data))
             })
@@ -366,7 +370,10 @@ impl Tetra3 {
 
         let read_1d_u32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<u32>> {
             arc.by_name(name).ok().and_then(|mut zf| {
-                let npy = NpyFile::new(&mut zf).ok()?;
+                let mut buf = Vec::new();
+                zf.read_to_end(&mut buf).ok()?;
+                let mut cursor = Cursor::new(&buf);
+                let npy = NpyFile::new(&mut cursor).ok()?;
                 let data: Vec<u32> = npy.into_vec().ok()?;
                 Some(Array1::from_vec(data))
             })
@@ -399,46 +406,50 @@ impl Tetra3 {
         db_props.insert("presort_patterns".to_string(), 0.0);
 
         if let Ok(mut zf) = archive.by_name("props_packed.npy") {
-            if NpyFile::new(&mut zf).is_ok() {
-                let mut data = vec![0u8; 828]; 
-                if zf.read_exact(&mut data).is_ok() {
-                    let mut hash_type = String::new();
-                    for i in 0..64 {
-                        let offset = 256 + (i * 4);
-                        let c = data[offset];
-                        if c == 0 { break; } 
-                        hash_type.push(c as char);
+            let mut buf = Vec::new();
+            if zf.read_to_end(&mut buf).is_ok() {
+                let mut cursor = Cursor::new(&buf);
+                if NpyFile::new(&mut cursor).is_ok() {
+                    let mut data = vec![0u8; 828]; 
+                    if cursor.read_exact(&mut data).is_ok() {
+                        let mut hash_type = String::new();
+                        for i in 0..64 {
+                            let offset = 256 + (i * 4);
+                            let c = data[offset];
+                            if c == 0 { break; } 
+                            hash_type.push(c as char);
+                        }
+                        if hash_type.trim() == "linear_probe" {
+                            linear_probe = true;
+                        }
+
+                        let p_size = u16::from_le_bytes([data[512], data[513]]);
+                        db_props.insert("pattern_size".to_string(), p_size as f64);
+                        
+                        let p_bins = u16::from_le_bytes([data[514], data[515]]);
+                        db_props.insert("pattern_bins".to_string(), p_bins as f64);
+                        
+                        let p_max_err = f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
+                        db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
+                        
+                        let max_fov = f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
+                        db_props.insert("max_fov".to_string(), max_fov as f64);
+                        
+                        let min_fov = f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
+                        db_props.insert("min_fov".to_string(), min_fov as f64);
+
+                        let eq = u16::from_le_bytes([data[784], data[785]]);
+                        db_props.insert("epoch_equinox".to_string(), eq as f64);
+
+                        let pm = f32::from_le_bytes([data[786], data[787], data[788], data[789]]);
+                        db_props.insert("epoch_proper_motion".to_string(), pm as f64);
+
+                        let vs = u16::from_le_bytes([data[800], data[801]]);
+                        db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
+                        
+                        let presort = data[824] != 0;
+                        db_props.insert("presort_patterns".to_string(), if presort { 1.0 } else { 0.0 });
                     }
-                    if hash_type.trim() == "linear_probe" {
-                        linear_probe = true;
-                    }
-
-                    let p_size = u16::from_le_bytes([data[512], data[513]]);
-                    db_props.insert("pattern_size".to_string(), p_size as f64);
-                    
-                    let p_bins = u16::from_le_bytes([data[514], data[515]]);
-                    db_props.insert("pattern_bins".to_string(), p_bins as f64);
-                    
-                    let p_max_err = f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
-                    db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
-                    
-                    let max_fov = f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
-                    db_props.insert("max_fov".to_string(), max_fov as f64);
-                    
-                    let min_fov = f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
-                    db_props.insert("min_fov".to_string(), min_fov as f64);
-
-                    let eq = u16::from_le_bytes([data[784], data[785]]);
-                    db_props.insert("epoch_equinox".to_string(), eq as f64);
-
-                    let pm = f32::from_le_bytes([data[786], data[787], data[788], data[789]]);
-                    db_props.insert("epoch_proper_motion".to_string(), pm as f64);
-
-                    let vs = u16::from_le_bytes([data[800], data[801]]);
-                    db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
-                    
-                    let presort = data[824] != 0;
-                    db_props.insert("presort_patterns".to_string(), if presort { 1.0 } else { 0.0 });
                 }
             }
         }
@@ -604,7 +615,7 @@ impl Tetra3 {
         }
         let num_extracted_stars = num_centroids; 
 
-        // Maintain the original full set of image_centroids for the final matrix building
+        // Extract slice, ensuring original precision is maintained exactly as provided snippet did
         let image_centroids = star_centroids.slice(s![..num_centroids, ..]).to_owned();
 
         let mut image_centroids_undist = match options.distortion {
@@ -734,15 +745,16 @@ impl Tetra3 {
                     let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
                     let image_center_vector = [rotation_matrix[[0, 0]], rotation_matrix[[0, 1]], rotation_matrix[[0, 2]]];
                     
-                    let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2);
+                    // FIX 1: Add epsilon to ensure edge-boundary points align with Python's euclidean math
+                    let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
                     let mut nearby_cat_stars_inds: Vec<usize> = self.star_kd_tree
                         .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
                         .into_iter()
                         .map(|n| n.item as usize)
                         .collect();
                     
-                    // Emulate np.sort(nearby) directly matching the python array logic
-                    nearby_cat_stars_inds.sort_unstable();
+                    // FIX 2: Emulate Python's np.sort(nearby) to ensure brightness ordering of KDTree output
+                    nearby_cat_stars_inds.sort_unstable(); 
                     
                     let num_nearby_catalog_stars = nearby_cat_stars_inds.len();
                     if num_nearby_catalog_stars == 0 { continue; }
@@ -755,6 +767,7 @@ impl Tetra3 {
                     let nearby_cat_star_vectors_derot = rotation_matrix.dot(&nearby_cat_star_vectors.t()).t().to_owned();
                     let (nearby_cat_star_centroids_all, kept) = compute_centroids(&nearby_cat_star_vectors_derot, height, width, fov);
                     
+                    // Python truncates by `2 * num_centroids` to enforce tight match boundaries
                     let crop_len = kept.len().min(2 * num_centroids);
                     
                     let mut valid_cat_centroids = Array2::zeros((crop_len, 2));
@@ -776,16 +789,21 @@ impl Tetra3 {
                     let num_star_matches = matched_stars.len();
                     
                     let prob_single_star_mismatch = (crop_len as f64) * options.match_radius.powi(2);
-                    let p_mismatch_clamp = (1.0 - prob_single_star_mismatch).clamp(0.0, 1.0);
-                    let binom_k = (num_extracted_stars as i64 - (num_star_matches as i64 - 2)).max(0) as u64;
-                    let prob_mismatch = match Binomial::new(p_mismatch_clamp, num_extracted_stars as u64) {
-                        Ok(b) => b.cdf(binom_k),
-                        Err(_) => continue,
+                    let p_raw = 1.0 - prob_single_star_mismatch;
+                    let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
+                    
+                    // FIX 3: Accurately replicate Python's Binomial CDF Negative Domain NaN Bypass 
+                    let prob_mismatch = if p_raw <= 0.0 || p_raw >= 1.0 || k_raw < 0 {
+                        0.0 
+                    } else {
+                        match Binomial::new(p_raw, num_extracted_stars as u64) {
+                            Ok(b) => b.cdf(k_raw as u64),
+                            Err(_) => 0.0,
+                        }
                     };
 
                     if prob_mismatch >= match_threshold { continue; }
 
-                    // CRITICAL FIX: Extract centroids and compute vectors against `fov` locally
                     let mut matched_img_cents = Array2::zeros((num_star_matches, 2));
                     let mut matched_cat_vecs = Array2::zeros((num_star_matches, 3));
                     for (i, &(img_idx, cat_idx)) in matched_stars.iter().enumerate() {
@@ -803,7 +821,6 @@ impl Tetra3 {
                         let derotated_matched_cat = precise_rotation_matrix.dot(&matched_cat_vecs.t()).t().to_owned();
 
                         for (i, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                            // CRITICAL FIX: Distorted centroids are required for the Ax=b solve
                             let r_cent = &image_centroids.row(img_idx); 
                             let r_dist = ((r_cent[0] - height/2.0).powi(2) + (r_cent[1] - width/2.0).powi(2)).sqrt() / width * 2.0;
                             let cat_derot = &derotated_matched_cat.row(i);
@@ -821,13 +838,12 @@ impl Tetra3 {
                             fov = 2.0 * (1.0 / f_val).atan();
                             image_centroids_undist = undistort_centroids(&image_centroids, height, width, sol[1]);
                             
-                            // Re-populate matched_img_cents with dynamically re-undistorted values
                             for (i, &(img_idx, _)) in matched_stars.iter().enumerate() {
                                 matched_img_cents.row_mut(i).assign(&image_centroids_undist.row(img_idx));
                             }
                         }
                     } else {
-                        // Distortion is None, refine fov exactly as Python
+                        // FIX 4: Refine analytic FOV dynamically if no distortion is modelled
                         let angles_camera: Vec<f64> = pdist(&matched_img_vecs).into_iter().map(angle_from_distance).collect();
                         let angles_catalogue: Vec<f64> = pdist(&matched_cat_vecs).into_iter().map(angle_from_distance).collect();
                         if !angles_camera.is_empty() {
@@ -839,12 +855,12 @@ impl Tetra3 {
                         }
                     }
 
-                    // Must use the freshly updated matched_img_cents
+                    // Apply refined FOV projection dynamically
                     let final_match_vectors = compute_vectors(&matched_img_cents, height, width, fov);
                     let final_derotated = precise_rotation_matrix.t().dot(&final_match_vectors.t()).t().to_owned();
                     
                     let mut distances: Vec<f64> = (0..num_star_matches).map(|i| {
-                        let row_f = final_derotated.row(i); // matched_stars array is sorted inherently
+                        let row_f = final_derotated.row(i); 
                         let row_c = matched_cat_vecs.row(i);
                         ((row_f[0]-row_c[0]).powi(2) + (row_f[1]-row_c[1]).powi(2) + (row_f[2]-row_c[2]).powi(2)).sqrt()
                     }).collect();
