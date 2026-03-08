@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil oakamil@gmail.com
+// See LICENSE file in root directory for license terms.
+
 use std::{
     fs::File,
     io::{Cursor, Read},

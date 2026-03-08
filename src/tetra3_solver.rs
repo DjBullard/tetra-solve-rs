@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Omair Kamil oakamil@gmail.com
+// Copyright (c) 2026 Omair Kamil oakamil@gmail.com
 // See LICENSE file in root directory for license terms.
 
 use std::{
@@ -168,7 +168,7 @@ mod tests {
         fs::File,
         io::{Cursor, Read},
         path::Path,
-        time::Instant, // Import Instant for timing
+        time::Instant,
     };
 
     use prost::Message;
