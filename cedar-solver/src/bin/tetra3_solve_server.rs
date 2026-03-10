@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 use clap::Parser;
 use log::info;
@@ -52,7 +52,7 @@ impl Tetra3Rpc for MyTetra3Solver {
             fov_max_error: req.fov_max_error,
             match_radius: req.match_radius.unwrap_or(default_options.match_radius),
             match_threshold: req.match_threshold.unwrap_or(default_options.match_threshold),
-            solve_timeout_ms: req.solve_timeout.map(|d| {
+            solve_timeout_ms: req.solve_timeout.as_ref().map(|d| {
                 d.seconds as f64 * 1000.0 + d.nanos as f64 / 1_000_000.0
             }),
             distortion: req.distortion,
@@ -83,14 +83,35 @@ impl Tetra3Rpc for MyTetra3Solver {
             options.target_sky_coord = Some(target_sky_arr);
         }
 
-        // Call the solver (holds the mutex for the duration of solve).
-        let result = {
+        // Hard gRPC-level timeout backstop. Catches mutex contention and
+        // any edge case where the solver overshoots its internal checks.
+        let timeout_duration = req.solve_timeout
+            .map(|d| {
+                StdDuration::from_secs(d.seconds as u64)
+                    + StdDuration::from_nanos(d.nanos as u64)
+            })
+            .unwrap_or(StdDuration::from_secs(5));
+
+        let solver_outcome = tokio::time::timeout(timeout_duration, async {
             let mut solver = self.solver.lock().await;
             solver.solve_from_centroids(&centroids_arr, size, options)
-        };
+        })
+        .await;
 
         // Map Solution -> proto SolveResult.
         let solve_time = prost_types::Duration::try_from(rpc_start.elapsed()).ok();
+
+        let result = match solver_outcome {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                // tokio timeout fired — return Timeout status.
+                return Ok(tonic::Response::new(SolveResult {
+                    status: Some(ProtoSolveStatus::Timeout.into()),
+                    solve_time,
+                    ..Default::default()
+                }));
+            }
+        };
 
         let status = match result.status {
             SolveStatus::MatchFound => ProtoSolveStatus::MatchFound,
