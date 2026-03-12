@@ -57,14 +57,13 @@ impl SolverTrait for Tetra3Solver {
         params: &SolveParams,
         _imu_estimate: Option<EquatorialCoordinates>,
     ) -> Result<PlateSolution, CanonicalError> {
-        
         let mut tetra3 = self.inner.lock().await;
 
         // Convert slice of struct coordinates into the required ndarray Matrix
         // Tetra3 primarily maps image vectors as N x 2 (y, x).
         let mut flat_buffer = Vec::with_capacity(star_centroids.len() * 2);
         for c in star_centroids {
-            flat_buffer.push(c.y as f64); 
+            flat_buffer.push(c.y as f64);
             flat_buffer.push(c.x as f64);
         }
         let centroids_array = Array2::from_shape_vec((star_centroids.len(), 2), flat_buffer)
@@ -97,7 +96,7 @@ impl SolverTrait for Tetra3Solver {
             match_radius: params.match_radius.unwrap_or(0.01),
             match_threshold: params.match_threshold.unwrap_or(1e-4),
             // Bypassing Duration vs f64 ambiguity on traits using a static safe max timeout
-            solve_timeout_ms: Some(5000.0), 
+            solve_timeout_ms: Some(5000.0),
             distortion: params.distortion,
             match_max_error: params.match_max_error.unwrap_or(0.005),
             return_matches: extension.return_matches,
@@ -108,11 +107,12 @@ impl SolverTrait for Tetra3Solver {
         };
 
         // Pass the properly mapped array into the solver
-        let result = tetra3.solve_from_centroids(&centroids_array, (height as f64, width as f64), options);
+        let result =
+            tetra3.solve_from_centroids(&centroids_array, (height as f64, width as f64), options);
 
         match result.status {
             SolveStatus::MatchFound => {
-                // Convert the raw f64 milliseconds into a standard Duration, 
+                // Convert the raw f64 milliseconds into a standard Duration,
                 // then convert that into the required Protobuf Duration struct.
                 let solve_duration = Duration::from_secs_f64(result.t_solve_ms / 1000.0);
 

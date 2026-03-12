@@ -112,13 +112,21 @@ fn distance_from_angle(angle: f64) -> f64 {
 // OPTIMIZATION: Replaces incredibly heavy `statrs::Binomial` cdf calculation inside hot loops.
 // Nanosecond execution time for small N probabilities, exactly mirroring scipy.stats.binom.cdf.
 fn fast_binomial_cdf(k: i64, n: u64, p: f64) -> f64 {
-    if k < 0 { return 0.0; }
-    if k >= n as i64 { return 1.0; }
-    if p <= 0.0 { return 1.0; }
-    if p >= 1.0 { return 0.0; }
-    
+    if k < 0 {
+        return 0.0;
+    }
+    if k >= n as i64 {
+        return 1.0;
+    }
+    if p <= 0.0 {
+        return 1.0;
+    }
+    if p >= 1.0 {
+        return 0.0;
+    }
+
     let mut cdf = 0.0;
-    let mut term = (1.0 - p).powi(n as i32); 
+    let mut term = (1.0 - p).powi(n as i32);
     cdf += term;
     for i in 1..=(k as u64) {
         term = term * (n - i + 1) as f64 / i as f64 * p / (1.0 - p);
@@ -127,7 +135,12 @@ fn fast_binomial_cdf(k: i64, n: u64, p: f64) -> f64 {
     cdf
 }
 
-fn compute_vectors_flat(centroids: &[[f64; 2]], height: f64, width: f64, fov: f64) -> Vec<[f64; 3]> {
+fn compute_vectors_flat(
+    centroids: &[[f64; 2]],
+    height: f64,
+    width: f64,
+    fov: f64,
+) -> Vec<[f64; 3]> {
     let scale_factor = (fov / 2.0).tan() / width * 2.0;
     let img_center_y = height / 2.0;
     let img_center_x = width / 2.0;
@@ -223,7 +236,9 @@ fn distort_centroids(
         let dx = row[1] - width / 2.0;
         let r_undist = (dy * dy + dx * dx).sqrt();
 
-        if r_undist < 1e-8 { continue; }
+        if r_undist < 1e-8 {
+            continue;
+        }
 
         let mut r_dist = r_undist;
         for _ in 0..maxiter {
@@ -231,7 +246,9 @@ fn distort_centroids(
             let dru_drd = (1.0 - 2.0 * kp * r_dist) / (1.0 - k);
             let error = r_undist - r_undist_est;
             r_dist += error / dru_drd;
-            if error.abs() < tol { break; }
+            if error.abs() < tol {
+                break;
+            }
         }
         let scale = r_dist / r_undist;
         row[0] = (dy * scale) + height / 2.0;
@@ -373,6 +390,363 @@ fn generate_pattern_keys(
     }
 }
 
+// Helper to build the solution
+#[allow(clippy::too_many_arguments)]
+fn verify_and_build_solution(
+    scratch: &mut Scratchpads,
+    star_kd_tree: &KdTree<f64, 3>,
+    star_table_flat: &[CatalogStar],
+    star_catalog_ids: &Option<Array1<u32>>,
+    db_props: &HashMap<String, f64>,
+    num_patterns: usize,
+    rotation_matrix: &Matrix3<f64>,
+    mut fov: f64,
+    height: f64,
+    width: f64,
+    options: &SolveOptions,
+    image_centroids: &[[f64; 2]],
+    image_centroids_undist: &mut Vec<[f64; 2]>,
+    num_extracted_stars: usize,
+    match_threshold: f64,
+    t0_solve: Instant,
+) -> Option<Solution> {
+    // Find all catalog stars inside the FOV diagonal
+    let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
+    let image_center_vector = [
+        rotation_matrix[(0, 0)],
+        rotation_matrix[(0, 1)],
+        rotation_matrix[(0, 2)],
+    ];
+
+    // Epsilon to capture borders safely in f64
+    let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
+    let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
+        .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
+        .into_iter()
+        .map(|n| n.item as usize)
+        .collect();
+
+    // Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
+    nearby_cat_stars_inds.sort_unstable();
+
+    let num_nearby = nearby_cat_stars_inds.len();
+    if num_nearby == 0 {
+        return None;
+    }
+
+    if scratch.sp_nearby_cat_star_vectors.len() < num_nearby {
+        let new_size = num_nearby.max(scratch.sp_nearby_cat_star_vectors.len() * 2);
+        scratch
+            .sp_nearby_cat_star_vectors
+            .resize(new_size, [0.0; 3]);
+        scratch
+            .sp_nearby_cat_star_vectors_derot
+            .resize(new_size, [0.0; 3]);
+        scratch
+            .sp_nearby_cat_star_centroids_all
+            .resize(new_size, [0.0; 2]);
+    }
+
+    for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
+        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
+    }
+
+    rotate_vectors_inplace(
+        rotation_matrix,
+        &scratch.sp_nearby_cat_star_vectors[..num_nearby],
+        false,
+        &mut scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
+        num_nearby,
+    );
+    compute_centroids_inplace(
+        &scratch.sp_nearby_cat_star_vectors_derot[..num_nearby],
+        height,
+        width,
+        fov,
+        &mut scratch.sp_nearby_cat_star_centroids_all[..num_nearby],
+        &mut scratch.sp_kept,
+        num_nearby,
+    );
+
+    let crop_len = scratch.sp_kept.len().min(2 * num_extracted_stars);
+
+    if scratch.sp_valid_cat_centroids.len() < crop_len {
+        let new_size = crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
+        scratch.sp_valid_cat_centroids.resize(new_size, [0.0; 2]);
+        scratch.sp_valid_cat_vectors.resize(new_size, [0.0; 3]);
+    }
+    scratch.sp_valid_cat_inds.clear();
+
+    for (c_idx, &x) in scratch.sp_kept.iter().take(crop_len).enumerate() {
+        scratch.sp_valid_cat_centroids[c_idx] = scratch.sp_nearby_cat_star_centroids_all[x];
+        scratch.sp_valid_cat_vectors[c_idx] = scratch.sp_nearby_cat_star_vectors[x];
+        scratch.sp_valid_cat_inds.push(nearby_cat_stars_inds[x]);
+    }
+
+    let matched_stars = find_centroid_matches_inplace(
+        image_centroids_undist,
+        num_extracted_stars,
+        &scratch.sp_valid_cat_centroids,
+        crop_len,
+        width * options.match_radius,
+    );
+
+    // Probability Calculation
+    let num_star_matches = matched_stars.len();
+    let prob_single_star_mismatch = (crop_len as f64) * options.match_radius.powi(2);
+    let p_raw = 1.0 - prob_single_star_mismatch;
+    let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
+
+    // Safe bounds bypass replicating scipy.stats.binom.cdf behavior
+    let prob_mismatch = fast_binomial_cdf(k_raw, num_extracted_stars as u64, p_raw);
+    if prob_mismatch >= match_threshold {
+        return None;
+    }
+
+    // We passed all checks. Complete the final exact solution details
+    let mut matched_img_cents = Vec::with_capacity(num_star_matches);
+    let mut matched_cat_vecs = Vec::with_capacity(num_star_matches);
+    for &(img_idx, cat_idx) in &matched_stars {
+        matched_img_cents.push(image_centroids_undist[img_idx]);
+        matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
+    }
+
+    let matched_img_vecs = compute_vectors_flat(&matched_img_cents, height, width, fov);
+    let (precise_rotation_matrix, _) = find_rotation_matrix_and_det_inplace(
+        &matched_img_vecs,
+        &matched_cat_vecs,
+        num_star_matches,
+    );
+
+    let mut k_final = options.distortion;
+    if options.distortion.is_some() {
+        // Refine fov & distortion using Least Squares System
+        // A = [tangent, radius^3], b = [radius]
+        // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
+        let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
+        let mut b_na = DVector::<f64>::zeros(num_star_matches);
+        let mut derotated_matched_cat = vec![[0.0; 3]; num_star_matches];
+        rotate_vectors_inplace(
+            &precise_rotation_matrix,
+            &matched_cat_vecs,
+            false,
+            &mut derotated_matched_cat,
+            num_star_matches,
+        );
+
+        for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
+            let r_cent = image_centroids[img_idx];
+            let r_dist = ((r_cent[0] - height / 2.0).powi(2) + (r_cent[1] - width / 2.0).powi(2))
+                .sqrt()
+                / width
+                * 2.0;
+            let cat_derot = derotated_matched_cat[m_idx];
+            let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
+            a_na[(m_idx, 0)] = tangent;
+            a_na[(m_idx, 1)] = r_dist.powi(3);
+            b_na[m_idx] = r_dist;
+        }
+
+        // Pure-Rust SVD Pseudo-Inverse for Distortions
+        let svd = SVD::new(a_na, true, true);
+        if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
+            let sol = pseudo_inv * b_na;
+            let f_val = sol[0] / (1.0 - sol[1]);
+            k_final = Some(sol[1]);
+            fov = 2.0 * (1.0 / f_val).atan();
+            *image_centroids_undist = undistort_centroids(image_centroids, height, width, sol[1]);
+            for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
+                matched_img_cents[m_idx] = image_centroids_undist[img_idx];
+            }
+        }
+    }
+
+    let final_match_vectors = compute_vectors_flat(&matched_img_cents, height, width, fov);
+    let mut final_derotated = vec![[0.0; 3]; num_star_matches];
+    rotate_vectors_inplace(
+        &precise_rotation_matrix,
+        &final_match_vectors,
+        true,
+        &mut final_derotated,
+        num_star_matches,
+    );
+
+    let mut distances: Vec<f64> = (0..num_star_matches)
+        .map(|m_idx| {
+            let row_f = final_derotated[m_idx];
+            let row_c = matched_cat_vecs[m_idx];
+            ((row_f[0] - row_c[0]).powi(2)
+                + (row_f[1] - row_c[1]).powi(2)
+                + (row_f[2] - row_c[2]).powi(2))
+            .sqrt()
+        })
+        .collect();
+    distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let p90_idx = (0.9 * (distances.len() - 1) as f64) as usize;
+    let p90_err_angle = angle_from_distance(distances[p90_idx]).to_degrees() * 3600.0;
+    let max_err_angle = angle_from_distance(*distances.last().unwrap()).to_degrees() * 3600.0;
+
+    let mut rms_sum = 0.0;
+    for &d in &distances {
+        let a = angle_from_distance(d);
+        rms_sum += a * a;
+    }
+    let rms_err_angle = (rms_sum / distances.len() as f64).sqrt().to_degrees() * 3600.0;
+
+    let ra = precise_rotation_matrix[(0, 1)]
+        .atan2(precise_rotation_matrix[(0, 0)])
+        .to_degrees()
+        .rem_euclid(360.0);
+    let dec = precise_rotation_matrix[(0, 2)]
+        .atan2(
+            (precise_rotation_matrix[(1, 2)].powi(2) + precise_rotation_matrix[(2, 2)].powi(2))
+                .sqrt(),
+        )
+        .to_degrees();
+    let roll = precise_rotation_matrix[(1, 2)]
+        .atan2(precise_rotation_matrix[(2, 2)])
+        .to_degrees()
+        .rem_euclid(360.0);
+
+    let mut precise_rot_arr2 = Array2::zeros((3, 3));
+    for r in 0..3 {
+        for c in 0..3 {
+            precise_rot_arr2[[r, c]] = precise_rotation_matrix[(r, c)];
+        }
+    }
+
+    let mut solution = Solution {
+        ra: Some(ra),
+        dec: Some(dec),
+        roll: Some(roll),
+        fov: Some(fov.to_degrees()),
+        distortion: k_final,
+        rmse: Some(rms_err_angle),
+        p90e: Some(p90_err_angle),
+        maxe: Some(max_err_angle),
+        matches: Some(num_star_matches),
+        prob: Some(prob_mismatch * (num_patterns as f64)),
+        epoch_equinox: db_props.get("epoch_equinox").cloned(),
+        epoch_proper_motion: db_props.get("epoch_proper_motion").cloned(),
+        status: SolveStatus::MatchFound,
+        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
+    };
+
+    if options.return_rotation_matrix {
+        solution.rotation_matrix = Some(precise_rot_arr2);
+    }
+    if let Some(target_px) = &options.target_pixel {
+        let mut px_flat = Vec::with_capacity(target_px.nrows());
+        for row in 0..target_px.nrows() {
+            px_flat.push([target_px[[row, 0]], target_px[[row, 1]]]);
+        }
+        if let Some(k) = k_final {
+            px_flat = undistort_centroids(&px_flat, height, width, k);
+        }
+        let target_vector = compute_vectors_flat(&px_flat, height, width, fov);
+        let mut rotated_target_vector = vec![[0.0; 3]; target_vector.len()];
+        rotate_vectors_inplace(
+            &precise_rotation_matrix,
+            &target_vector,
+            true,
+            &mut rotated_target_vector,
+            target_vector.len(),
+        );
+        let mut target_ra = Vec::new();
+        let mut target_dec = Vec::new();
+        for v in rotated_target_vector {
+            target_ra.push(v[1].atan2(v[0]).to_degrees().rem_euclid(360.0));
+            target_dec.push(90.0 - v[2].acos().to_degrees());
+        }
+        solution.target_ra = Some(target_ra);
+        solution.target_dec = Some(target_dec);
+    }
+    if let Some(target_sky) = &options.target_sky_coord {
+        let mut target_sky_vecs = Vec::with_capacity(target_sky.nrows());
+        for row in 0..target_sky.nrows() {
+            let ra_rad = target_sky[[row, 0]].to_radians();
+            let dec_rad = target_sky[[row, 1]].to_radians();
+            target_sky_vecs.push([
+                ra_rad.cos() * dec_rad.cos(),
+                ra_rad.sin() * dec_rad.cos(),
+                dec_rad.sin(),
+            ]);
+        }
+        let mut target_sky_vecs_derot = vec![[0.0; 3]; target_sky_vecs.len()];
+        rotate_vectors_inplace(
+            &precise_rotation_matrix,
+            &target_sky_vecs,
+            false,
+            &mut target_sky_vecs_derot,
+            target_sky_vecs.len(),
+        );
+        let mut target_centroids = vec![[0.0; 2]; target_sky_vecs.len()];
+        let mut kept_sky = Vec::new();
+        compute_centroids_inplace(
+            &target_sky_vecs_derot,
+            height,
+            width,
+            fov,
+            &mut target_centroids,
+            &mut kept_sky,
+            target_sky_vecs.len(),
+        );
+        if let Some(k) = k_final {
+            for &k_idx in &kept_sky {
+                let distorted =
+                    distort_centroids(&[target_centroids[k_idx]], height, width, k, 1e-6, 30);
+                target_centroids[k_idx] = distorted[0];
+            }
+        }
+        let mut target_y = vec![None; target_sky.nrows()];
+        let mut target_x = vec![None; target_sky.nrows()];
+        for &k_idx in &kept_sky {
+            target_y[k_idx] = Some(target_centroids[k_idx][0]);
+            target_x[k_idx] = Some(target_centroids[k_idx][1]);
+        }
+        solution.target_y = Some(target_y);
+        solution.target_x = Some(target_x);
+    }
+    if options.return_matches {
+        let mut m_cents = Vec::new();
+        let mut m_stars = Vec::new();
+        let mut m_ids = Vec::new();
+        for &(img_idx, cat_idx) in &matched_stars {
+            m_cents.push(image_centroids_undist[img_idx]);
+            let star_idx = scratch.sp_valid_cat_inds[cat_idx];
+            let star = &star_table_flat[star_idx];
+            m_stars.push([star.ra.to_degrees(), star.dec.to_degrees(), star.mag]);
+            if let Some(ids) = star_catalog_ids {
+                m_ids.push(ids[star_idx]);
+            }
+        }
+        solution.matched_centroids = Some(m_cents);
+        solution.matched_stars = Some(m_stars);
+        if !m_ids.is_empty() {
+            solution.matched_cat_id = Some(m_ids);
+        }
+    }
+    if options.return_catalog {
+        let mut cat_stars = Vec::new();
+        for c_idx in 0..crop_len {
+            let star_idx = scratch.sp_valid_cat_inds[c_idx];
+            let star = &star_table_flat[star_idx];
+            cat_stars.push((
+                star.ra.to_degrees(),
+                star.dec.to_degrees(),
+                star.mag,
+                scratch.sp_valid_cat_centroids[c_idx][0],
+                scratch.sp_valid_cat_centroids[c_idx][1],
+            ));
+        }
+        solution.catalog_stars = Some(cat_stars);
+    }
+
+    Some(solution)
+}
+
 // --- Ported Utility Functions ---
 
 fn separation_for_density(fov: f64, stars_per_fov: f64) -> f64 {
@@ -406,7 +780,7 @@ fn breadth_first_combinations(sequence: &[usize], r: usize) -> Vec<Vec<usize>> {
 pub struct Scratchpads {
     // Fast path structs (p_size == 4)
     pub sp_pattern_key_list: Vec<(usize, [usize; 5])>,
-    
+
     // Core matching scratchpads
     pub sp_cat_edges_list: Vec<Vec<f64>>,
     pub sp_cat_vectors_list: Vec<Vec<[f64; 3]>>,
@@ -415,8 +789,8 @@ pub struct Scratchpads {
     pub sp_image_pattern_vectors_sorted: Vec<[f64; 3]>,
     pub sp_radii_scratch: Vec<(f64, usize)>,
     pub sp_catalog_pattern_vectors_sorted: Vec<[f64; 3]>,
-    pub sp_nearby_cat_star_vectors: Vec<[f64; 3]>, 
-    pub sp_nearby_cat_star_vectors_derot: Vec<[f64; 3]>, 
+    pub sp_nearby_cat_star_vectors: Vec<[f64; 3]>,
+    pub sp_nearby_cat_star_vectors_derot: Vec<[f64; 3]>,
     pub sp_nearby_cat_star_centroids_all: Vec<[f64; 2]>,
     pub sp_kept: Vec<usize>,
     pub sp_valid_cat_centroids: Vec<[f64; 2]>,
@@ -443,15 +817,15 @@ impl Scratchpads {
             sp_pattern_key_list: Vec::with_capacity(512),
             sp_cat_edges_list: Vec::with_capacity(32),
             sp_cat_vectors_list: Vec::with_capacity(32),
-            
+
             sp_p_cents: vec![[0.0; 2]; max_size],
             sp_p_vecs: vec![[0.0; 3]; max_size],
             sp_image_pattern_vectors_sorted: vec![[0.0; 3]; max_size],
             sp_radii_scratch: Vec::with_capacity(max_size),
             sp_catalog_pattern_vectors_sorted: vec![[0.0; 3]; max_size],
-            
-            sp_nearby_cat_star_vectors: Vec::with_capacity(256), 
-            sp_nearby_cat_star_vectors_derot: Vec::with_capacity(256), 
+
+            sp_nearby_cat_star_vectors: Vec::with_capacity(256),
+            sp_nearby_cat_star_vectors_derot: Vec::with_capacity(256),
             sp_nearby_cat_star_centroids_all: Vec::with_capacity(256),
             sp_kept: Vec::with_capacity(256),
 
@@ -481,7 +855,7 @@ pub struct Tetra3 {
     pub star_table_flat: Vec<CatalogStar>,
     pub pattern_catalog_flat: Vec<usize>,
     pub star_kd_tree: KdTree<f64, 3>,
-    
+
     pub pattern_largest_edge: Option<Array1<f32>>,
     pub pattern_key_hashes: Option<Array1<u16>>,
     pub star_catalog_ids: Option<Array1<u32>>,
@@ -497,7 +871,9 @@ impl Tetra3 {
         let file = File::open(path)?;
         let mut archive = ZipArchive::new(file)?;
 
-        let read_star_table = |arc: &mut ZipArchive<File>, name: &str| -> Result<Array2<f64>, Box<dyn std::error::Error>> {
+        let read_star_table = |arc: &mut ZipArchive<File>,
+                               name: &str|
+         -> Result<Array2<f64>, Box<dyn std::error::Error>> {
             let mut zf = arc.by_name(name)?;
             let mut buf = Vec::new();
             zf.read_to_end(&mut buf)?;
@@ -507,16 +883,24 @@ impl Tetra3 {
             let mut cursor = Cursor::new(&buf);
             let npy2 = NpyFile::new(&mut cursor)?;
             if let Ok(data) = npy2.into_vec::<f64>() {
-                return Ok(Array2::from_shape_vec((shape[0] as usize, shape[1] as usize), data)?);
+                return Ok(Array2::from_shape_vec(
+                    (shape[0] as usize, shape[1] as usize),
+                    data,
+                )?);
             }
             let mut cursor = Cursor::new(&buf);
             let npy3 = NpyFile::new(&mut cursor)?;
             let data_f32: Vec<f32> = npy3.into_vec()?;
             let data: Vec<f64> = data_f32.into_iter().map(|v| v as f64).collect();
-            Ok(Array2::from_shape_vec((shape[0] as usize, shape[1] as usize), data)?)
+            Ok(Array2::from_shape_vec(
+                (shape[0] as usize, shape[1] as usize),
+                data,
+            )?)
         };
 
-        let read_pattern_catalog = |arc: &mut ZipArchive<File>, name: &str| -> Result<Array2<usize>, Box<dyn std::error::Error>> {
+        let read_pattern_catalog = |arc: &mut ZipArchive<File>,
+                                    name: &str|
+         -> Result<Array2<usize>, Box<dyn std::error::Error>> {
             let mut zf = arc.by_name(name)?;
             let mut buf = Vec::new();
             zf.read_to_end(&mut buf)?;
@@ -527,13 +911,19 @@ impl Tetra3 {
             let npy2 = NpyFile::new(&mut cursor)?;
             if let Ok(data_u16) = npy2.into_vec::<u16>() {
                 let data: Vec<usize> = data_u16.into_iter().map(|v| v as usize).collect();
-                return Ok(Array2::from_shape_vec((shape[0] as usize, shape[1] as usize), data)?);
+                return Ok(Array2::from_shape_vec(
+                    (shape[0] as usize, shape[1] as usize),
+                    data,
+                )?);
             }
             let mut cursor = Cursor::new(&buf);
             let npy3 = NpyFile::new(&mut cursor)?;
             let data_u32: Vec<u32> = npy3.into_vec()?;
             let data: Vec<usize> = data_u32.into_iter().map(|v| v as usize).collect();
-            Ok(Array2::from_shape_vec((shape[0] as usize, shape[1] as usize), data)?)
+            Ok(Array2::from_shape_vec(
+                (shape[0] as usize, shape[1] as usize),
+                data,
+            )?)
         };
 
         let read_1d_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<f32>> {
@@ -578,7 +968,11 @@ impl Tetra3 {
             star_table_flat.push(CatalogStar {
                 ra: star_table_arr[[i, 0]],
                 dec: star_table_arr[[i, 1]],
-                vec: [star_table_arr[[i, 2]], star_table_arr[[i, 3]], star_table_arr[[i, 4]]],
+                vec: [
+                    star_table_arr[[i, 2]],
+                    star_table_arr[[i, 3]],
+                    star_table_arr[[i, 4]],
+                ],
                 mag: star_table_arr[[i, 5]],
             });
         }
@@ -617,20 +1011,27 @@ impl Tetra3 {
                         for i in 0..64 {
                             let offset = 256 + (i * 4);
                             let c = data[offset];
-                            if c == 0 { break; }
+                            if c == 0 {
+                                break;
+                            }
                             hash_type.push(c as char);
                         }
-                        if hash_type.trim() == "linear_probe" { linear_probe = true; }
+                        if hash_type.trim() == "linear_probe" {
+                            linear_probe = true;
+                        }
 
                         let p_size = u16::from_le_bytes([data[512], data[513]]);
                         db_props.insert("pattern_size".to_string(), p_size as f64);
                         let p_bins = u16::from_le_bytes([data[514], data[515]]);
                         db_props.insert("pattern_bins".to_string(), p_bins as f64);
-                        let p_max_err = f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
+                        let p_max_err =
+                            f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
                         db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
-                        let max_fov = f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
+                        let max_fov =
+                            f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
                         db_props.insert("max_fov".to_string(), max_fov as f64);
-                        let min_fov = f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
+                        let min_fov =
+                            f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
                         db_props.insert("min_fov".to_string(), min_fov as f64);
                         let eq = u16::from_le_bytes([data[784], data[785]]);
                         db_props.insert("epoch_equinox".to_string(), eq as f64);
@@ -639,8 +1040,13 @@ impl Tetra3 {
                         let vs = u16::from_le_bytes([data[800], data[801]]);
                         db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
                         let presort = data[823] != 0;
-                        db_props.insert("presort_patterns".to_string(), if presort { 1.0 } else { 0.0 });
-                        num_patterns = u32::from_le_bytes([data[824], data[825], data[826], data[827]]) as usize;
+                        db_props.insert(
+                            "presort_patterns".to_string(),
+                            if presort { 1.0 } else { 0.0 },
+                        );
+                        num_patterns =
+                            u32::from_le_bytes([data[824], data[825], data[826], data[827]])
+                                as usize;
                     }
                 }
             }
@@ -691,7 +1097,11 @@ impl Tetra3 {
 
     #[inline(always)]
     fn pattern_key_hash_to_index(hash: u64, max_index: u64, linear_probe: bool) -> u64 {
-        if linear_probe { hash % max_index } else { hash.wrapping_mul(MAGIC_RAND) % max_index }
+        if linear_probe {
+            hash % max_index
+        } else {
+            hash.wrapping_mul(MAGIC_RAND) % max_index
+        }
     }
 
     fn get_table_indices_from_hash_inplace(
@@ -704,9 +1114,13 @@ impl Tetra3 {
         out_found.clear();
         let max_ind = (pattern_catalog_flat.len() / p_size) as u64;
         for c in 0.. {
-            let i = if linear_probe { (hash_index + c) % max_ind } else { (hash_index + c * c) % max_ind };
+            let i = if linear_probe {
+                (hash_index + c) % max_ind
+            } else {
+                (hash_index + c * c) % max_ind
+            };
             let row_start = (i as usize) * p_size;
-            
+
             let mut is_empty = true;
             for j in 0..p_size {
                 if pattern_catalog_flat[row_start + j] != 0 {
@@ -714,7 +1128,9 @@ impl Tetra3 {
                     break;
                 }
             }
-            if is_empty { break; }
+            if is_empty {
+                break;
+            }
             out_found.push(i as usize);
         }
     }
@@ -735,11 +1151,17 @@ impl Tetra3 {
         out_edges: &mut Vec<Vec<f64>>,
         out_vectors: &mut Vec<Vec<[f64; 3]>>,
     ) {
-        Self::get_table_indices_from_hash_inplace(pattern_catalog_flat, p_size, hash_index, linear_probe, sp_hash_match_inds);
-        if sp_hash_match_inds.is_empty() { 
+        Self::get_table_indices_from_hash_inplace(
+            pattern_catalog_flat,
+            p_size,
+            hash_index,
+            linear_probe,
+            sp_hash_match_inds,
+        );
+        if sp_hash_match_inds.is_empty() {
             out_edges.clear();
             out_vectors.clear();
-            return; 
+            return;
         }
 
         if let Some(hashes) = pattern_key_hashes {
@@ -747,7 +1169,9 @@ impl Tetra3 {
             sp_hash_match_inds.retain(|&idx| hashes[idx] == key_hash16);
         }
 
-        if let (Some(largest_edges), Some(f_est), Some(f_err)) = (pattern_largest_edge, fov_estimate, fov_max_error) {
+        if let (Some(largest_edges), Some(f_est), Some(f_err)) =
+            (pattern_largest_edge, fov_estimate, fov_max_error)
+        {
             sp_hash_match_inds.retain(|&idx| {
                 let cat_largest_edge = largest_edges[idx] as f64;
                 let fov2 = cat_largest_edge / image_pattern_largest_edge * f_est / 1000.0;
@@ -756,8 +1180,12 @@ impl Tetra3 {
         }
 
         let num_matches = sp_hash_match_inds.len();
-        while out_edges.len() < num_matches { out_edges.push(Vec::with_capacity(16)); }
-        while out_vectors.len() < num_matches { out_vectors.push(vec![[0.0; 3]; p_size]); }
+        while out_edges.len() < num_matches {
+            out_edges.push(Vec::with_capacity(16));
+        }
+        while out_vectors.len() < num_matches {
+            out_vectors.push(vec![[0.0; 3]; p_size]);
+        }
         out_edges.truncate(num_matches);
         out_vectors.truncate(num_matches);
 
@@ -791,19 +1219,27 @@ impl Tetra3 {
     ) -> Solution {
         let t0_solve = Instant::now();
         let (height, width) = size;
-        
+
         self.cancelled.store(false, Ordering::Relaxed);
 
-        let fov_initial = options.fov_estimate.map(|f| f.to_radians()).unwrap_or_else(|| {
-            let max_f = self.db_props.get("max_fov").unwrap_or(&20.0);
-            let min_f = self.db_props.get("min_fov").unwrap_or(&10.0);
-            ((max_f + min_f) / 2.0).to_radians()
-        });
+        let fov_initial = options
+            .fov_estimate
+            .map(|f| f.to_radians())
+            .unwrap_or_else(|| {
+                let max_f = self.db_props.get("max_fov").unwrap_or(&20.0);
+                let min_f = self.db_props.get("min_fov").unwrap_or(&10.0);
+                ((max_f + min_f) / 2.0).to_radians()
+            });
 
         let p_size = *self.db_props.get("pattern_size").unwrap_or(&4.0) as usize;
         let p_bins = *self.db_props.get("pattern_bins").unwrap_or(&50.0) as usize;
-        let verification_stars = *self.db_props.get("verification_stars_per_fov").unwrap_or(&10.0) as usize;
-        let p_max_err = options.match_max_error.max(*self.db_props.get("pattern_max_error").unwrap_or(&0.002));
+        let verification_stars = *self
+            .db_props
+            .get("verification_stars_per_fov")
+            .unwrap_or(&10.0) as usize;
+        let p_max_err = options
+            .match_max_error
+            .max(*self.db_props.get("pattern_max_error").unwrap_or(&0.002));
         let match_threshold = options.match_threshold / (self.num_patterns as f64);
         let presorted = *self.db_props.get("presort_patterns").unwrap_or(&0.0) == 1.0;
 
@@ -817,7 +1253,8 @@ impl Tetra3 {
         }
 
         // Thinning Strategy
-        let pattern_stars_separation_pixels = width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
+        let pattern_stars_separation_pixels =
+            width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
         let mut keep_for_patterns = vec![false; num_centroids_raw];
 
         for i in 0..num_centroids_raw {
@@ -826,17 +1263,24 @@ impl Tetra3 {
             for j in 0..i {
                 if keep_for_patterns[j] {
                     let c_j = star_centroids.row(j);
-                    if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt() < pattern_stars_separation_pixels {
+                    if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt()
+                        < pattern_stars_separation_pixels
+                    {
                         occupied = true;
                         break;
                     }
                 }
             }
-            if !occupied { keep_for_patterns[i] = true; }
+            if !occupied {
+                keep_for_patterns[i] = true;
+            }
         }
 
-        let mut pattern_centroids_inds: Vec<usize> = keep_for_patterns.into_iter().enumerate()
-            .filter_map(|(i, keep)| if keep { Some(i) } else { None }).collect();
+        let mut pattern_centroids_inds: Vec<usize> = keep_for_patterns
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, keep)| if keep { Some(i) } else { None })
+            .collect();
 
         let mut num_extracted_stars = num_centroids_raw;
         if num_centroids_raw > verification_stars {
@@ -856,7 +1300,8 @@ impl Tetra3 {
             image_centroids.clone()
         };
 
-        let image_centroids_vectors = compute_vectors_flat(&image_centroids_undist, height, width, fov_initial);
+        let image_centroids_vectors =
+            compute_vectors_flat(&image_centroids_undist, height, width, fov_initial);
 
         // OPTIMIZATION: Precompute pairwise distance angles exactly ONCE.
         // Drops 6 sqrt and 6 asin operations per iteration inside the hot combinatorics loop.
@@ -866,7 +1311,10 @@ impl Tetra3 {
             for j in (i + 1)..num_vecs {
                 let v_i = image_centroids_vectors[i];
                 let v_j = image_centroids_vectors[j];
-                let dist = ((v_i[0] - v_j[0]).powi(2) + (v_i[1] - v_j[1]).powi(2) + (v_i[2] - v_j[2]).powi(2)).sqrt();
+                let dist = ((v_i[0] - v_j[0]).powi(2)
+                    + (v_i[1] - v_j[1]).powi(2)
+                    + (v_i[2] - v_j[2]).powi(2))
+                .sqrt();
                 let ang = angle_from_distance(dist);
                 precomputed_angles[i * num_vecs + j] = ang;
                 precomputed_angles[j * num_vecs + i] = ang;
@@ -880,7 +1328,7 @@ impl Tetra3 {
         let pattern_key_hashes = &self.pattern_key_hashes;
         let pattern_largest_edge = &self.pattern_largest_edge;
         let linear_probe = self.linear_probe;
-        
+
         let n_inds = pattern_centroids_inds.len();
 
         // -------------------------------------------------------------
@@ -889,26 +1337,28 @@ impl Tetra3 {
         // -------------------------------------------------------------
         if p_size == 4 && n_inds >= 4 {
             for l in 3..n_inds {
+                // OPTIMIZATION: Moving timeout and cancellation checks here.
+                // Checking Instant::now() is a syscall. Moved out of the absolute deepest loop.
+                if let Some(timeout) = options.solve_timeout_ms {
+                    if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
+                        return Solution {
+                            status: SolveStatus::Timeout,
+                            t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                            ..Default::default()
+                        };
+                    }
+                }
+                if self.cancelled.load(Ordering::Relaxed) {
+                    return Solution {
+                        status: SolveStatus::Cancelled,
+                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                        ..Default::default()
+                    };
+                }
+
                 for k in 2..l {
                     for j in 1..k {
                         for i in 0..j {
-                            if let Some(timeout) = options.solve_timeout_ms {
-                                if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
-                                    return Solution {
-                                        status: SolveStatus::Timeout,
-                                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                        ..Default::default()
-                                    };
-                                }
-                            }
-                            if self.cancelled.load(Ordering::Relaxed) {
-                                return Solution {
-                                    status: SolveStatus::Cancelled,
-                                    t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                    ..Default::default()
-                                };
-                            }
-
                             let p_i = pattern_centroids_inds[i];
                             let p_j = pattern_centroids_inds[j];
                             let p_k = pattern_centroids_inds[k];
@@ -923,20 +1373,22 @@ impl Tetra3 {
                                 precomputed_angles[p_j * num_vecs + p_l],
                                 precomputed_angles[p_k * num_vecs + p_l],
                             ];
-                            
+
                             // Calculate edge angles and sort
                             edges.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                             let image_pattern_largest_edge = edges[5];
-                            
+
                             // Min/max edge ration bounds
                             let mut key_space_min = [0; 5];
                             let mut key_space_max = [0; 5];
                             let mut target_keys = [0isize; 5];
-                            
+
                             for x in 0..5 {
                                 let ratio = edges[x] / image_pattern_largest_edge;
-                                key_space_min[x] = ((ratio - p_max_err).max(0.0) * p_bins as f64) as usize;
-                                key_space_max[x] = ((ratio + p_max_err).min(1.0) * p_bins as f64) as usize;
+                                key_space_min[x] =
+                                    ((ratio - p_max_err).max(0.0) * p_bins as f64) as usize;
+                                key_space_max[x] =
+                                    ((ratio + p_max_err).min(1.0) * p_bins as f64) as usize;
                                 target_keys[x] = (ratio * p_bins as f64) as isize;
                             }
 
@@ -947,312 +1399,184 @@ impl Tetra3 {
                                     for k2 in key_space_min[2]..=key_space_max[2] {
                                         for k3 in key_space_min[3]..=key_space_max[3] {
                                             for k4 in key_space_min[4]..=key_space_max[4] {
-                                                let diff0 = k0 as isize - target_keys[0]; 
-                                                let diff1 = k1 as isize - target_keys[1]; 
-                                                let diff2 = k2 as isize - target_keys[2]; 
-                                                let diff3 = k3 as isize - target_keys[3]; 
-                                                let diff4 = k4 as isize - target_keys[4]; 
-                                                let dist = diff0*diff0 + diff1*diff1 + diff2*diff2 + diff3*diff3 + diff4*diff4;
-                                                scratch.sp_pattern_key_list.push((dist as usize, [k0, k1, k2, k3, k4]));
+                                                let diff0 = k0 as isize - target_keys[0];
+                                                let diff1 = k1 as isize - target_keys[1];
+                                                let diff2 = k2 as isize - target_keys[2];
+                                                let diff3 = k3 as isize - target_keys[3];
+                                                let diff4 = k4 as isize - target_keys[4];
+                                                let dist = diff0 * diff0
+                                                    + diff1 * diff1
+                                                    + diff2 * diff2
+                                                    + diff3 * diff3
+                                                    + diff4 * diff4;
+                                                scratch
+                                                    .sp_pattern_key_list
+                                                    .push((dist as usize, [k0, k1, k2, k3, k4]));
                                             }
                                         }
                                     }
                                 }
                             }
 
-                            // Explore closest hash codes first
-                            scratch.sp_pattern_key_list.sort_unstable_by_key(|k| k.0);
                             let mut image_pattern_largest_distance = None;
 
-                            for (_, pattern_key) in scratch.sp_pattern_key_list.iter() {
-                                let pattern_key_hash = Self::compute_pattern_key_hash_4(pattern_key, p_bins);
-                                let hash_index = Self::pattern_key_hash_to_index(pattern_key_hash, (pattern_catalog_flat.len() / p_size) as u64, linear_probe);
-
-                                Self::get_all_patterns_for_index_inplace(
-                                    pattern_key_hash, hash_index, image_pattern_largest_edge,
-                                    options.fov_estimate.map(|x| x.to_radians()),
-                                    options.fov_max_error.map(|x| x.to_radians()),
-                                    pattern_catalog_flat, p_size, pattern_key_hashes, pattern_largest_edge,
-                                    star_table_flat, linear_probe, 
-                                    &mut scratch.sp_hash_match_inds, &mut scratch.sp_cat_edges_list, &mut scratch.sp_cat_vectors_list,
+                            for key_idx in 0..scratch.sp_pattern_key_list.len() {
+                                let pattern_key = scratch.sp_pattern_key_list[key_idx].1;
+                                let pattern_key_hash =
+                                    Self::compute_pattern_key_hash_4(&pattern_key, p_bins);
+                                let hash_index = Self::pattern_key_hash_to_index(
+                                    pattern_key_hash,
+                                    (pattern_catalog_flat.len() / p_size) as u64,
+                                    linear_probe,
                                 );
 
-                                for (idx, cat_edges) in scratch.sp_cat_edges_list.iter().enumerate() {
-                                    let catalog_largest_edge = *cat_edges.last().unwrap();
+                                Self::get_all_patterns_for_index_inplace(
+                                    pattern_key_hash,
+                                    hash_index,
+                                    image_pattern_largest_edge,
+                                    options.fov_estimate.map(|x| x.to_radians()),
+                                    options.fov_max_error.map(|x| x.to_radians()),
+                                    pattern_catalog_flat,
+                                    p_size,
+                                    pattern_key_hashes,
+                                    pattern_largest_edge,
+                                    star_table_flat,
+                                    linear_probe,
+                                    &mut scratch.sp_hash_match_inds,
+                                    &mut scratch.sp_cat_edges_list,
+                                    &mut scratch.sp_cat_vectors_list,
+                                );
+
+                                for cat_idx in 0..scratch.sp_cat_edges_list.len() {
+                                    let catalog_largest_edge =
+                                        *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
                                     let mut valid = true;
                                     for x in 0..5 {
-                                        let cat_ratio = cat_edges[x] / catalog_largest_edge;
+                                        let cat_ratio = scratch.sp_cat_edges_list[cat_idx][x]
+                                            / catalog_largest_edge;
                                         let img_ratio = edges[x] / image_pattern_largest_edge;
-                                        if cat_ratio < img_ratio - p_max_err || cat_ratio > img_ratio + p_max_err {
-                                            valid = false; break;
+                                        if cat_ratio < img_ratio - p_max_err
+                                            || cat_ratio > img_ratio + p_max_err
+                                        {
+                                            valid = false;
+                                            break;
                                         }
                                     }
-                                    if !valid { continue; }
+                                    if !valid {
+                                        continue;
+                                    }
 
                                     // We have a matched pattern! Calculate refined FOV
-                                    let mut fov;
+                                    let fov;
                                     if options.fov_estimate.is_some() {
-                                        fov = catalog_largest_edge / image_pattern_largest_edge * fov_initial;
+                                        fov = catalog_largest_edge / image_pattern_largest_edge
+                                            * fov_initial;
                                     } else {
                                         if image_pattern_largest_distance.is_none() {
-                                            let pts = [image_centroids_undist[p_i], image_centroids_undist[p_j], image_centroids_undist[p_k], image_centroids_undist[p_l]];
+                                            let pts = [
+                                                image_centroids_undist[p_i],
+                                                image_centroids_undist[p_j],
+                                                image_centroids_undist[p_k],
+                                                image_centroids_undist[p_l],
+                                            ];
                                             let mut max_dist = 0.0;
                                             for r in 0..4 {
-                                                for c in (r+1)..4 {
-                                                    let d = ((pts[r][0]-pts[c][0]).powi(2) + (pts[r][1]-pts[c][1]).powi(2)).sqrt();
-                                                    if d > max_dist { max_dist = d; }
+                                                for c in (r + 1)..4 {
+                                                    let d = ((pts[r][0] - pts[c][0]).powi(2)
+                                                        + (pts[r][1] - pts[c][1]).powi(2))
+                                                    .sqrt();
+                                                    if d > max_dist {
+                                                        max_dist = d;
+                                                    }
                                                 }
                                             }
                                             image_pattern_largest_distance = Some(max_dist);
                                         }
-                                        let f = image_pattern_largest_distance.unwrap() / 2.0 / (catalog_largest_edge / 2.0).tan();
+                                        let f = image_pattern_largest_distance.unwrap()
+                                            / 2.0
+                                            / (catalog_largest_edge / 2.0).tan();
                                         fov = 2.0 * (width / 2.0 / f).atan();
                                     }
 
                                     // Re-calculate vectors uniquely sorted by radius to centroid
-                                    let pts = [image_centroids_undist[p_i], image_centroids_undist[p_j], image_centroids_undist[p_k], image_centroids_undist[p_l]];
-                                    compute_vectors_inplace(&pts, height, width, fov, &mut scratch.sp_p_vecs, 4);
-                                    sort_vectors_by_radius_inplace(&scratch.sp_p_vecs, &mut scratch.sp_image_pattern_vectors_sorted, &mut scratch.sp_radii_scratch, 4);
+                                    let pts = [
+                                        image_centroids_undist[p_i],
+                                        image_centroids_undist[p_j],
+                                        image_centroids_undist[p_k],
+                                        image_centroids_undist[p_l],
+                                    ];
+                                    compute_vectors_inplace(
+                                        &pts,
+                                        height,
+                                        width,
+                                        fov,
+                                        &mut scratch.sp_p_vecs,
+                                        4,
+                                    );
+                                    sort_vectors_by_radius_inplace(
+                                        &scratch.sp_p_vecs,
+                                        &mut scratch.sp_image_pattern_vectors_sorted,
+                                        &mut scratch.sp_radii_scratch,
+                                        4,
+                                    );
 
                                     if presorted {
-                                        scratch.sp_catalog_pattern_vectors_sorted[..4].copy_from_slice(&scratch.sp_cat_vectors_list[idx][..4]);
+                                        scratch.sp_catalog_pattern_vectors_sorted[..4]
+                                            .copy_from_slice(
+                                                &scratch.sp_cat_vectors_list[cat_idx][..4],
+                                            );
                                     } else {
-                                        sort_vectors_by_radius_inplace(&scratch.sp_cat_vectors_list[idx], &mut scratch.sp_catalog_pattern_vectors_sorted, &mut scratch.sp_radii_scratch, 4);
+                                        sort_vectors_by_radius_inplace(
+                                            &scratch.sp_cat_vectors_list[cat_idx],
+                                            &mut scratch.sp_catalog_pattern_vectors_sorted,
+                                            &mut scratch.sp_radii_scratch,
+                                            4,
+                                        );
                                     };
 
-                                    let (rotation_matrix, det) = find_rotation_matrix_and_det_inplace(&scratch.sp_image_pattern_vectors_sorted, &scratch.sp_catalog_pattern_vectors_sorted, 4);
-                                    if det < 0.0 { continue; }
-
-                                    // Find all catalog stars inside the FOV diagonal
-                                    let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
-                                    let image_center_vector = [rotation_matrix[(0, 0)], rotation_matrix[(0, 1)], rotation_matrix[(0, 2)]];
-
-                                    // Epsilon to capture borders safely in f64
-                                    let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
-                                    let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
-                                        .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
-                                        .into_iter().map(|n| n.item as usize).collect();
-                                    
-                                    // Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
-                                    nearby_cat_stars_inds.sort_unstable();
-
-                                    let num_nearby = nearby_cat_stars_inds.len();
-                                    if num_nearby == 0 { continue; }
-
-                                    if scratch.sp_nearby_cat_star_vectors.len() < num_nearby {
-                                        let new_size = num_nearby.max(scratch.sp_nearby_cat_star_vectors.len() * 2);
-                                        scratch.sp_nearby_cat_star_vectors.resize(new_size, [0.0; 3]);
-                                        scratch.sp_nearby_cat_star_vectors_derot.resize(new_size, [0.0; 3]);
-                                        scratch.sp_nearby_cat_star_centroids_all.resize(new_size, [0.0; 2]);
+                                    let (rotation_matrix, det) =
+                                        find_rotation_matrix_and_det_inplace(
+                                            &scratch.sp_image_pattern_vectors_sorted,
+                                            &scratch.sp_catalog_pattern_vectors_sorted,
+                                            4,
+                                        );
+                                    if det < 0.0 {
+                                        continue;
                                     }
 
-                                    for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
-                                        scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
+                                    if let Some(solution) = verify_and_build_solution(
+                                        scratch,
+                                        star_kd_tree,
+                                        star_table_flat,
+                                        &self.star_catalog_ids,
+                                        &self.db_props,
+                                        self.num_patterns,
+                                        &rotation_matrix,
+                                        fov,
+                                        height,
+                                        width,
+                                        &options,
+                                        &image_centroids,
+                                        &mut image_centroids_undist,
+                                        num_extracted_stars,
+                                        match_threshold,
+                                        t0_solve,
+                                    ) {
+                                        return solution;
                                     }
-
-                                    rotate_vectors_inplace(&rotation_matrix, &scratch.sp_nearby_cat_star_vectors[..num_nearby], false, &mut scratch.sp_nearby_cat_star_vectors_derot[..num_nearby], num_nearby);
-                                    compute_centroids_inplace(&scratch.sp_nearby_cat_star_vectors_derot[..num_nearby], height, width, fov, &mut scratch.sp_nearby_cat_star_centroids_all[..num_nearby], &mut scratch.sp_kept, num_nearby);
-
-                                    let crop_len = scratch.sp_kept.len().min(2 * num_extracted_stars);
-
-                                    if scratch.sp_valid_cat_centroids.len() < crop_len {
-                                        let new_size = crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
-                                        scratch.sp_valid_cat_centroids.resize(new_size, [0.0; 2]);
-                                        scratch.sp_valid_cat_vectors.resize(new_size, [0.0; 3]);
-                                    }
-                                    scratch.sp_valid_cat_inds.clear();
-
-                                    for (c_idx, &x) in scratch.sp_kept.iter().take(crop_len).enumerate() {
-                                        scratch.sp_valid_cat_centroids[c_idx] = scratch.sp_nearby_cat_star_centroids_all[x];
-                                        scratch.sp_valid_cat_vectors[c_idx] = scratch.sp_nearby_cat_star_vectors[x];
-                                        scratch.sp_valid_cat_inds.push(nearby_cat_stars_inds[x]);
-                                    }
-
-                                    let matched_stars = find_centroid_matches_inplace(&image_centroids_undist, num_extracted_stars, &scratch.sp_valid_cat_centroids, crop_len, width * options.match_radius);
-
-                                    // Probability Calculation
-                                    let num_star_matches = matched_stars.len();
-                                    let prob_single_star_mismatch = (crop_len as f64) * options.match_radius.powi(2);
-                                    let p_raw = 1.0 - prob_single_star_mismatch;
-                                    let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
-
-                                    // Safe bounds bypass replicating scipy.stats.binom.cdf behavior
-                                    let prob_mismatch = fast_binomial_cdf(k_raw, num_extracted_stars as u64, p_raw);
-                                    if prob_mismatch >= match_threshold { continue; }
-
-                                    // We passed all checks. Complete the final exact solution details
-                                    let mut matched_img_cents = Vec::with_capacity(num_star_matches);
-                                    let mut matched_cat_vecs = Vec::with_capacity(num_star_matches);
-                                    for &(img_idx, cat_idx) in &matched_stars {
-                                        matched_img_cents.push(image_centroids_undist[img_idx]);
-                                        matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
-                                    }
-
-                                    let matched_img_vecs = compute_vectors_flat(&matched_img_cents, height, width, fov);
-                                    let (precise_rotation_matrix, _) = find_rotation_matrix_and_det_inplace(&matched_img_vecs, &matched_cat_vecs, num_star_matches);
-
-                                    let mut k_final = options.distortion;
-                                    if options.distortion.is_some() {
-                                        // Refine fov & distortion using Least Squares System
-                                        // A = [tangent, radius^3], b = [radius]
-                                        // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
-                                        let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
-                                        let mut b_na = DVector::<f64>::zeros(num_star_matches);
-                                        let mut derotated_matched_cat = vec![[0.0; 3]; num_star_matches];
-                                        rotate_vectors_inplace(&precise_rotation_matrix, &matched_cat_vecs, false, &mut derotated_matched_cat, num_star_matches);
-
-                                        for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                                            let r_cent = image_centroids[img_idx];
-                                            let r_dist = ((r_cent[0] - height / 2.0).powi(2) + (r_cent[1] - width / 2.0).powi(2)).sqrt() / width * 2.0;
-                                            let cat_derot = derotated_matched_cat[m_idx];
-                                            let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
-                                            a_na[(m_idx, 0)] = tangent;
-                                            a_na[(m_idx, 1)] = r_dist.powi(3);
-                                            b_na[m_idx] = r_dist;
-                                        }
-
-                                        // Pure-Rust SVD Pseudo-Inverse for Distortions
-                                        let svd = SVD::new(a_na, true, true);
-                                        if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
-                                            let sol = pseudo_inv * b_na;
-                                            let f_val = sol[0] / (1.0 - sol[1]);
-                                            k_final = Some(sol[1]);
-                                            fov = 2.0 * (1.0 / f_val).atan();
-                                            image_centroids_undist = undistort_centroids(&image_centroids, height, width, sol[1]);
-                                            for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                                                matched_img_cents[m_idx] = image_centroids_undist[img_idx];
-                                            }
-                                        }
-                                    }
-
-                                    let final_match_vectors = compute_vectors_flat(&matched_img_cents, height, width, fov);
-                                    let mut final_derotated = vec![[0.0; 3]; num_star_matches];
-                                    rotate_vectors_inplace(&precise_rotation_matrix, &final_match_vectors, true, &mut final_derotated, num_star_matches);
-
-                                    let mut distances: Vec<f64> = (0..num_star_matches).map(|m_idx| {
-                                        let row_f = final_derotated[m_idx];
-                                        let row_c = matched_cat_vecs[m_idx];
-                                        ((row_f[0] - row_c[0]).powi(2) + (row_f[1] - row_c[1]).powi(2) + (row_f[2] - row_c[2]).powi(2)).sqrt()
-                                    }).collect();
-                                    distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-
-                                    let p90_idx = (0.9 * (distances.len() - 1) as f64) as usize;
-                                    let p90_err_angle = angle_from_distance(distances[p90_idx]).to_degrees() * 3600.0;
-                                    let max_err_angle = angle_from_distance(*distances.last().unwrap()).to_degrees() * 3600.0;
-
-                                    let mut rms_sum = 0.0;
-                                    for &d in &distances {
-                                        let a = angle_from_distance(d);
-                                        rms_sum += a * a;
-                                    }
-                                    let rms_err_angle = (rms_sum / distances.len() as f64).sqrt().to_degrees() * 3600.0;
-
-                                    let ra = precise_rotation_matrix[(0, 1)].atan2(precise_rotation_matrix[(0, 0)]).to_degrees().rem_euclid(360.0);
-                                    let dec = precise_rotation_matrix[(0, 2)].atan2((precise_rotation_matrix[(1, 2)].powi(2) + precise_rotation_matrix[(2, 2)].powi(2)).sqrt()).to_degrees();
-                                    let roll = precise_rotation_matrix[(1, 2)].atan2(precise_rotation_matrix[(2, 2)]).to_degrees().rem_euclid(360.0);
-
-                                    let mut precise_rot_arr2 = Array2::zeros((3, 3));
-                                    for r in 0..3 { for c in 0..3 { precise_rot_arr2[[r, c]] = precise_rotation_matrix[(r, c)]; } }
-
-                                    let mut solution = Solution {
-                                        ra: Some(ra),
-                                        dec: Some(dec),
-                                        roll: Some(roll),
-                                        fov: Some(fov.to_degrees()),
-                                        distortion: k_final,
-                                        rmse: Some(rms_err_angle),
-                                        p90e: Some(p90_err_angle),
-                                        maxe: Some(max_err_angle),
-                                        matches: Some(num_star_matches),
-                                        prob: Some(prob_mismatch * (self.num_patterns as f64)),
-                                        epoch_equinox: self.db_props.get("epoch_equinox").cloned(),
-                                        epoch_proper_motion: self.db_props.get("epoch_proper_motion").cloned(),
-                                        status: SolveStatus::MatchFound,
-                                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                                        ..Default::default()
-                                    };
-
-                                    if options.return_rotation_matrix { solution.rotation_matrix = Some(precise_rot_arr2); }
-                                    if let Some(target_px) = &options.target_pixel {
-                                        let mut px_flat = Vec::with_capacity(target_px.nrows());
-                                        for row in 0..target_px.nrows() { px_flat.push([target_px[[row, 0]], target_px[[row, 1]]]); }
-                                        if let Some(k) = k_final { px_flat = undistort_centroids(&px_flat, height, width, k); }
-                                        let target_vector = compute_vectors_flat(&px_flat, height, width, fov);
-                                        let mut rotated_target_vector = vec![[0.0; 3]; target_vector.len()];
-                                        rotate_vectors_inplace(&precise_rotation_matrix, &target_vector, true, &mut rotated_target_vector, target_vector.len());
-                                        let mut target_ra = Vec::new();
-                                        let mut target_dec = Vec::new();
-                                        for v in rotated_target_vector {
-                                            target_ra.push(v[1].atan2(v[0]).to_degrees().rem_euclid(360.0));
-                                            target_dec.push(90.0 - v[2].acos().to_degrees());
-                                        }
-                                        solution.target_ra = Some(target_ra);
-                                        solution.target_dec = Some(target_dec);
-                                    }
-                                    if let Some(target_sky) = &options.target_sky_coord {
-                                        let mut target_sky_vecs = Vec::with_capacity(target_sky.nrows());
-                                        for row in 0..target_sky.nrows() {
-                                            let ra_rad = target_sky[[row, 0]].to_radians();
-                                            let dec_rad = target_sky[[row, 1]].to_radians();
-                                            target_sky_vecs.push([ra_rad.cos() * dec_rad.cos(), ra_rad.sin() * dec_rad.cos(), dec_rad.sin()]);
-                                        }
-                                        let mut target_sky_vecs_derot = vec![[0.0; 3]; target_sky_vecs.len()];
-                                        rotate_vectors_inplace(&precise_rotation_matrix, &target_sky_vecs, false, &mut target_sky_vecs_derot, target_sky_vecs.len());
-                                        let mut target_centroids = vec![[0.0; 2]; target_sky_vecs.len()];
-                                        let mut kept_sky = Vec::new();
-                                        compute_centroids_inplace(&target_sky_vecs_derot, height, width, fov, &mut target_centroids, &mut kept_sky, target_sky_vecs.len());
-                                        if let Some(k) = k_final {
-                                            for &k_idx in &kept_sky {
-                                                let distorted = distort_centroids(&[target_centroids[k_idx]], height, width, k, 1e-6, 30);
-                                                target_centroids[k_idx] = distorted[0];
-                                            }
-                                        }
-                                        let mut target_y = vec![None; target_sky.nrows()];
-                                        let mut target_x = vec![None; target_sky.nrows()];
-                                        for &k_idx in &kept_sky {
-                                            target_y[k_idx] = Some(target_centroids[k_idx][0]);
-                                            target_x[k_idx] = Some(target_centroids[k_idx][1]);
-                                        }
-                                        solution.target_y = Some(target_y);
-                                        solution.target_x = Some(target_x);
-                                    }
-                                    if options.return_matches {
-                                        let mut m_cents = Vec::new();
-                                        let mut m_stars = Vec::new();
-                                        let mut m_ids = Vec::new();
-                                        for &(img_idx, cat_idx) in &matched_stars {
-                                            m_cents.push(image_centroids_undist[img_idx]);
-                                            let star_idx = scratch.sp_valid_cat_inds[cat_idx];
-                                            let star = &star_table_flat[star_idx];
-                                            m_stars.push([star.ra.to_degrees(), star.dec.to_degrees(), star.mag]);
-                                            if let Some(ids) = &self.star_catalog_ids { m_ids.push(ids[star_idx]); }
-                                        }
-                                        solution.matched_centroids = Some(m_cents);
-                                        solution.matched_stars = Some(m_stars);
-                                        if !m_ids.is_empty() { solution.matched_cat_id = Some(m_ids); }
-                                    }
-                                    if options.return_catalog {
-                                        let mut cat_stars = Vec::new();
-                                        for c_idx in 0..crop_len {
-                                            let star_idx = scratch.sp_valid_cat_inds[c_idx];
-                                            let star = &star_table_flat[star_idx];
-                                            cat_stars.push((star.ra.to_degrees(), star.dec.to_degrees(), star.mag, scratch.sp_valid_cat_centroids[c_idx][0], scratch.sp_valid_cat_centroids[c_idx][1]));
-                                        }
-                                        solution.catalog_stars = Some(cat_stars);
-                                    }
-                                    return solution;
                                 }
                             }
                         }
                     }
                 }
             }
-        } 
+        }
         // -------------------------------------------------------------
         // FALLBACK PATH: Non-standard p_size (!= 4)
         // -------------------------------------------------------------
         else {
-            for image_pattern_indices in breadth_first_combinations(&pattern_centroids_inds, p_size) {
+            for image_pattern_indices in breadth_first_combinations(&pattern_centroids_inds, p_size)
+            {
                 if let Some(timeout) = options.solve_timeout_ms {
                     if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
                         return Solution {
@@ -1289,12 +1613,16 @@ impl Tetra3 {
                 for &d in &scratch.sp_dists {
                     scratch.sp_edge_angles.push(angle_from_distance(d));
                 }
-                scratch.sp_edge_angles.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                scratch
+                    .sp_edge_angles
+                    .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
                 let image_pattern_largest_edge = *scratch.sp_edge_angles.last().unwrap();
                 scratch.sp_image_pattern.clear();
                 for i in 0..(scratch.sp_edge_angles.len() - 1) {
-                    scratch.sp_image_pattern.push(scratch.sp_edge_angles[i] / image_pattern_largest_edge);
+                    scratch
+                        .sp_image_pattern
+                        .push(scratch.sp_edge_angles[i] / image_pattern_largest_edge);
                 }
 
                 // Min/max edge ration bounds
@@ -1307,49 +1635,76 @@ impl Tetra3 {
                     let max_val = (ratio + p_max_err).min(1.0) * (p_bins as f64);
                     scratch.sp_pattern_key_space_min.push(min_val as usize);
                     scratch.sp_pattern_key_space_max.push(max_val as usize);
-                    scratch.sp_image_pattern_key.push((ratio * p_bins as f64) as usize);
+                    scratch
+                        .sp_image_pattern_key
+                        .push((ratio * p_bins as f64) as usize);
                 }
 
                 // Generate search space combinations via zero-allocation DFS (replaces Cartesian product)
                 scratch.sp_pattern_key_list_fallback.clear();
                 scratch.sp_pattern_key_current.clear();
                 generate_pattern_keys(
-                    &scratch.sp_pattern_key_space_min, 
-                    &scratch.sp_pattern_key_space_max, 
-                    &scratch.sp_image_pattern_key, 
-                    &mut scratch.sp_pattern_key_current, 
-                    &mut scratch.sp_pattern_key_list_fallback
+                    &scratch.sp_pattern_key_space_min,
+                    &scratch.sp_pattern_key_space_max,
+                    &scratch.sp_image_pattern_key,
+                    &mut scratch.sp_pattern_key_current,
+                    &mut scratch.sp_pattern_key_list_fallback,
                 );
 
                 // Explore closest hash codes first
-                scratch.sp_pattern_key_list_fallback.sort_unstable_by_key(|k| k.0);
+                scratch
+                    .sp_pattern_key_list_fallback
+                    .sort_unstable_by_key(|k| k.0);
                 let mut image_pattern_largest_distance = None;
 
-                for (_, pattern_key) in scratch.sp_pattern_key_list_fallback.iter() {
-                    let pattern_key_hash = Self::compute_pattern_key_hash(pattern_key, p_bins); 
-                    let hash_index = Self::pattern_key_hash_to_index(pattern_key_hash, (pattern_catalog_flat.len() / p_size) as u64, linear_probe);
-
-                    Self::get_all_patterns_for_index_inplace(
-                        pattern_key_hash, hash_index, image_pattern_largest_edge,
-                        options.fov_estimate.map(|x| x.to_radians()), options.fov_max_error.map(|x| x.to_radians()),
-                        pattern_catalog_flat, p_size, pattern_key_hashes, pattern_largest_edge,
-                        star_table_flat, linear_probe, 
-                        &mut scratch.sp_hash_match_inds, &mut scratch.sp_cat_edges_list, &mut scratch.sp_cat_vectors_list,
+                for key_idx in 0..scratch.sp_pattern_key_list_fallback.len() {
+                    let pattern_key_hash = Self::compute_pattern_key_hash(
+                        &scratch.sp_pattern_key_list_fallback[key_idx].1,
+                        p_bins,
+                    );
+                    let hash_index = Self::pattern_key_hash_to_index(
+                        pattern_key_hash,
+                        (pattern_catalog_flat.len() / p_size) as u64,
+                        linear_probe,
                     );
 
-                    for (idx, cat_edges) in scratch.sp_cat_edges_list.iter().enumerate() {
-                        let catalog_largest_edge = *cat_edges.last().unwrap();
+                    Self::get_all_patterns_for_index_inplace(
+                        pattern_key_hash,
+                        hash_index,
+                        image_pattern_largest_edge,
+                        options.fov_estimate.map(|x| x.to_radians()),
+                        options.fov_max_error.map(|x| x.to_radians()),
+                        pattern_catalog_flat,
+                        p_size,
+                        pattern_key_hashes,
+                        pattern_largest_edge,
+                        star_table_flat,
+                        linear_probe,
+                        &mut scratch.sp_hash_match_inds,
+                        &mut scratch.sp_cat_edges_list,
+                        &mut scratch.sp_cat_vectors_list,
+                    );
+
+                    for cat_idx in 0..scratch.sp_cat_edges_list.len() {
+                        let catalog_largest_edge =
+                            *scratch.sp_cat_edges_list[cat_idx].last().unwrap();
                         let mut valid = true;
-                        for i in 0..(cat_edges.len() - 1) {
-                            let cat_ratio = cat_edges[i] / catalog_largest_edge;
-                            if cat_ratio < scratch.sp_image_pattern[i] - p_max_err || cat_ratio > scratch.sp_image_pattern[i] + p_max_err {
-                                valid = false; break;
+                        for i in 0..(scratch.sp_cat_edges_list[cat_idx].len() - 1) {
+                            let cat_ratio =
+                                scratch.sp_cat_edges_list[cat_idx][i] / catalog_largest_edge;
+                            if cat_ratio < scratch.sp_image_pattern[i] - p_max_err
+                                || cat_ratio > scratch.sp_image_pattern[i] + p_max_err
+                            {
+                                valid = false;
+                                break;
                             }
                         }
-                        if !valid { continue; }
+                        if !valid {
+                            continue;
+                        }
 
                         // We have a matched pattern! Calculate refined FOV
-                        let mut fov;
+                        let fov;
                         if options.fov_estimate.is_some() {
                             fov = catalog_largest_edge / image_pattern_largest_edge * fov_initial;
                         } else {
@@ -1360,15 +1715,21 @@ impl Tetra3 {
                                 let mut max_dist = 0.0;
                                 for i in 0..p_size {
                                     for j in (i + 1)..p_size {
-                                        let dy = scratch.sp_p_cents[i][0] - scratch.sp_p_cents[j][0];
-                                        let dx = scratch.sp_p_cents[i][1] - scratch.sp_p_cents[j][1];
+                                        let dy =
+                                            scratch.sp_p_cents[i][0] - scratch.sp_p_cents[j][0];
+                                        let dx =
+                                            scratch.sp_p_cents[i][1] - scratch.sp_p_cents[j][1];
                                         let d = (dy * dy + dx * dx).sqrt();
-                                        if d > max_dist { max_dist = d; }
+                                        if d > max_dist {
+                                            max_dist = d;
+                                        }
                                     }
                                 }
                                 image_pattern_largest_distance = Some(max_dist);
                             }
-                            let f = image_pattern_largest_distance.unwrap() / 2.0 / (catalog_largest_edge / 2.0).tan();
+                            let f = image_pattern_largest_distance.unwrap()
+                                / 2.0
+                                / (catalog_largest_edge / 2.0).tan();
                             fov = 2.0 * (width / 2.0 / f).atan();
                         }
 
@@ -1376,235 +1737,63 @@ impl Tetra3 {
                         for (idx_p, &i) in image_pattern_indices.iter().enumerate() {
                             scratch.sp_p_cents[idx_p] = image_centroids_undist[i];
                         }
-                        
-                        compute_vectors_inplace(&scratch.sp_p_cents[..p_size], height, width, fov, &mut scratch.sp_p_vecs, p_size);
-                        sort_vectors_by_radius_inplace(&scratch.sp_p_vecs[..p_size], &mut scratch.sp_image_pattern_vectors_sorted, &mut scratch.sp_radii_scratch, p_size);
+
+                        compute_vectors_inplace(
+                            &scratch.sp_p_cents[..p_size],
+                            height,
+                            width,
+                            fov,
+                            &mut scratch.sp_p_vecs,
+                            p_size,
+                        );
+                        sort_vectors_by_radius_inplace(
+                            &scratch.sp_p_vecs[..p_size],
+                            &mut scratch.sp_image_pattern_vectors_sorted,
+                            &mut scratch.sp_radii_scratch,
+                            p_size,
+                        );
 
                         if presorted {
-                            scratch.sp_catalog_pattern_vectors_sorted[..p_size].copy_from_slice(&scratch.sp_cat_vectors_list[idx][..p_size]);
+                            scratch.sp_catalog_pattern_vectors_sorted[..p_size]
+                                .copy_from_slice(&scratch.sp_cat_vectors_list[cat_idx][..p_size]);
                         } else {
-                            sort_vectors_by_radius_inplace(&scratch.sp_cat_vectors_list[idx][..p_size], &mut scratch.sp_catalog_pattern_vectors_sorted, &mut scratch.sp_radii_scratch, p_size);
+                            sort_vectors_by_radius_inplace(
+                                &scratch.sp_cat_vectors_list[cat_idx][..p_size],
+                                &mut scratch.sp_catalog_pattern_vectors_sorted,
+                                &mut scratch.sp_radii_scratch,
+                                p_size,
+                            );
                         };
 
-                        let (rotation_matrix, det) = find_rotation_matrix_and_det_inplace(&scratch.sp_image_pattern_vectors_sorted[..p_size], &scratch.sp_catalog_pattern_vectors_sorted[..p_size], p_size);
-                        if det < 0.0 { continue; }
-
-                        // Find all catalog stars inside the FOV diagonal
-                        let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
-                        let image_center_vector = [rotation_matrix[(0, 0)], rotation_matrix[(0, 1)], rotation_matrix[(0, 2)]];
-
-                        // Epsilon to capture borders safely in f64
-                        let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
-                        let mut nearby_cat_stars_inds: Vec<usize> = star_kd_tree
-                            .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
-                            .into_iter()
-                            .map(|n| n.item as usize)
-                            .collect();
-
-                        // Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
-                        nearby_cat_stars_inds.sort_unstable();
-
-                        let num_nearby = nearby_cat_stars_inds.len();
-                        if num_nearby == 0 { continue; }
-
-                        if scratch.sp_nearby_cat_star_vectors.len() < num_nearby {
-                            let new_size = num_nearby.max(scratch.sp_nearby_cat_star_vectors.len() * 2);
-                            scratch.sp_nearby_cat_star_vectors.resize(new_size, [0.0; 3]);
-                            scratch.sp_nearby_cat_star_vectors_derot.resize(new_size, [0.0; 3]);
-                            scratch.sp_nearby_cat_star_centroids_all.resize(new_size, [0.0; 2]);
+                        let (rotation_matrix, det) = find_rotation_matrix_and_det_inplace(
+                            &scratch.sp_image_pattern_vectors_sorted[..p_size],
+                            &scratch.sp_catalog_pattern_vectors_sorted[..p_size],
+                            p_size,
+                        );
+                        if det < 0.0 {
+                            continue;
                         }
 
-                        for (n_idx, &star_idx) in nearby_cat_stars_inds.iter().enumerate() {
-                            scratch.sp_nearby_cat_star_vectors[n_idx] = star_table_flat[star_idx].vec;
+                        if let Some(solution) = verify_and_build_solution(
+                            scratch,
+                            star_kd_tree,
+                            star_table_flat,
+                            &self.star_catalog_ids,
+                            &self.db_props,
+                            self.num_patterns,
+                            &rotation_matrix,
+                            fov,
+                            height,
+                            width,
+                            &options,
+                            &image_centroids,
+                            &mut image_centroids_undist,
+                            num_extracted_stars,
+                            match_threshold,
+                            t0_solve,
+                        ) {
+                            return solution;
                         }
-
-                        rotate_vectors_inplace(&rotation_matrix, &scratch.sp_nearby_cat_star_vectors[..num_nearby], false, &mut scratch.sp_nearby_cat_star_vectors_derot[..num_nearby], num_nearby);
-                        compute_centroids_inplace(&scratch.sp_nearby_cat_star_vectors_derot[..num_nearby], height, width, fov, &mut scratch.sp_nearby_cat_star_centroids_all[..num_nearby], &mut scratch.sp_kept, num_nearby);
-
-                        let crop_len = scratch.sp_kept.len().min(2 * num_extracted_stars);
-
-                        if scratch.sp_valid_cat_centroids.len() < crop_len {
-                            let new_size = crop_len.max(scratch.sp_valid_cat_centroids.len() * 2);
-                            scratch.sp_valid_cat_centroids.resize(new_size, [0.0; 2]);
-                            scratch.sp_valid_cat_vectors.resize(new_size, [0.0; 3]);
-                        }
-                        scratch.sp_valid_cat_inds.clear();
-
-                        for (c_idx, &x) in scratch.sp_kept.iter().take(crop_len).enumerate() {
-                            scratch.sp_valid_cat_centroids[c_idx] = scratch.sp_nearby_cat_star_centroids_all[x];
-                            scratch.sp_valid_cat_vectors[c_idx] = scratch.sp_nearby_cat_star_vectors[x];
-                            scratch.sp_valid_cat_inds.push(nearby_cat_stars_inds[x]);
-                        }
-
-                        let matched_stars = find_centroid_matches_inplace(&image_centroids_undist, num_extracted_stars, &scratch.sp_valid_cat_centroids, crop_len, width * options.match_radius);
-
-                        // Probability Calculation
-                        let num_star_matches = matched_stars.len();
-                        let prob_single_star_mismatch = (crop_len as f64) * options.match_radius.powi(2);
-                        let p_raw = 1.0 - prob_single_star_mismatch;
-                        let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
-
-                        // Safe bounds bypass replicating scipy.stats.binom.cdf behavior
-                        let prob_mismatch = fast_binomial_cdf(k_raw, num_extracted_stars as u64, p_raw);
-                        if prob_mismatch >= match_threshold { continue; }
-
-                        // We passed all checks. Complete the final exact solution details
-                        let mut matched_img_cents = Vec::with_capacity(num_star_matches);
-                        let mut matched_cat_vecs = Vec::with_capacity(num_star_matches);
-                        for &(img_idx, cat_idx) in &matched_stars {
-                            matched_img_cents.push(image_centroids_undist[img_idx]);
-                            matched_cat_vecs.push(scratch.sp_valid_cat_vectors[cat_idx]);
-                        }
-
-                        let matched_img_vecs = compute_vectors_flat(&matched_img_cents, height, width, fov);
-                        let (precise_rotation_matrix, _) = find_rotation_matrix_and_det_inplace(&matched_img_vecs, &matched_cat_vecs, num_star_matches);
-
-                        let mut k_final = options.distortion;
-                        if options.distortion.is_some() {
-                            // Refine fov & distortion using Least Squares System
-                            // A = [tangent, radius^3], b = [radius]
-                            // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
-                            let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
-                            let mut b_na = DVector::<f64>::zeros(num_star_matches);
-                            let mut derotated_matched_cat = vec![[0.0; 3]; num_star_matches];
-                            rotate_vectors_inplace(&precise_rotation_matrix, &matched_cat_vecs, false, &mut derotated_matched_cat, num_star_matches);
-
-                            for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                                let r_cent = image_centroids[img_idx];
-                                let r_dist = ((r_cent[0] - height / 2.0).powi(2) + (r_cent[1] - width / 2.0).powi(2)).sqrt() / width * 2.0;
-                                let cat_derot = derotated_matched_cat[m_idx];
-                                let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
-                                a_na[(m_idx, 0)] = tangent;
-                                a_na[(m_idx, 1)] = r_dist.powi(3);
-                                b_na[m_idx] = r_dist;
-                            }
-
-                            // Pure-Rust SVD Pseudo-Inverse for Distortions
-                            let svd = SVD::new(a_na, true, true);
-                            if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
-                                let sol = pseudo_inv * b_na;
-                                let f_val = sol[0] / (1.0 - sol[1]);
-                                k_final = Some(sol[1]);
-                                fov = 2.0 * (1.0 / f_val).atan();
-                                image_centroids_undist = undistort_centroids(&image_centroids, height, width, sol[1]);
-                                for (m_idx, &(img_idx, _)) in matched_stars.iter().enumerate() {
-                                    matched_img_cents[m_idx] = image_centroids_undist[img_idx];
-                                }
-                            }
-                        }
-
-                        let final_match_vectors = compute_vectors_flat(&matched_img_cents, height, width, fov);
-                        let mut final_derotated = vec![[0.0; 3]; num_star_matches];
-                        rotate_vectors_inplace(&precise_rotation_matrix, &final_match_vectors, true, &mut final_derotated, num_star_matches);
-
-                        let mut distances: Vec<f64> = (0..num_star_matches).map(|m_idx| {
-                            let row_f = final_derotated[m_idx];
-                            let row_c = matched_cat_vecs[m_idx];
-                            ((row_f[0] - row_c[0]).powi(2) + (row_f[1] - row_c[1]).powi(2) + (row_f[2] - row_c[2]).powi(2)).sqrt()
-                        }).collect();
-                        distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-
-                        let p90_idx = (0.9 * (distances.len() - 1) as f64) as usize;
-                        let p90_err_angle = angle_from_distance(distances[p90_idx]).to_degrees() * 3600.0;
-                        let max_err_angle = angle_from_distance(*distances.last().unwrap()).to_degrees() * 3600.0;
-
-                        let mut rms_sum = 0.0;
-                        for &d in &distances {
-                            let a = angle_from_distance(d);
-                            rms_sum += a * a;
-                        }
-                        let rms_err_angle = (rms_sum / distances.len() as f64).sqrt().to_degrees() * 3600.0;
-
-                        let ra = precise_rotation_matrix[(0, 1)].atan2(precise_rotation_matrix[(0, 0)]).to_degrees().rem_euclid(360.0);
-                        let dec = precise_rotation_matrix[(0, 2)].atan2((precise_rotation_matrix[(1, 2)].powi(2) + precise_rotation_matrix[(2, 2)].powi(2)).sqrt()).to_degrees();
-                        let roll = precise_rotation_matrix[(1, 2)].atan2(precise_rotation_matrix[(2, 2)]).to_degrees().rem_euclid(360.0);
-
-                        let mut precise_rot_arr2 = Array2::zeros((3, 3));
-                        for r in 0..3 { for c in 0..3 { precise_rot_arr2[[r, c]] = precise_rotation_matrix[(r, c)]; } }
-
-                        let mut solution = Solution {
-                            ra: Some(ra),
-                            dec: Some(dec),
-                            roll: Some(roll),
-                            fov: Some(fov.to_degrees()),
-                            distortion: k_final,
-                            rmse: Some(rms_err_angle),
-                            p90e: Some(p90_err_angle),
-                            maxe: Some(max_err_angle),
-                            matches: Some(num_star_matches),
-                            prob: Some(prob_mismatch * (self.num_patterns as f64)),
-                            epoch_equinox: self.db_props.get("epoch_equinox").cloned(),
-                            epoch_proper_motion: self.db_props.get("epoch_proper_motion").cloned(),
-                            status: SolveStatus::MatchFound,
-                            t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                            ..Default::default()
-                        };
-
-                        if options.return_rotation_matrix { solution.rotation_matrix = Some(precise_rot_arr2); }
-                        if let Some(target_px) = &options.target_pixel {
-                            let mut px_flat = Vec::with_capacity(target_px.nrows());
-                            for row in 0..target_px.nrows() { px_flat.push([target_px[[row, 0]], target_px[[row, 1]]]); }
-                            if let Some(k) = k_final { px_flat = undistort_centroids(&px_flat, height, width, k); }
-                            let target_vector = compute_vectors_flat(&px_flat, height, width, fov);
-                            let mut rotated_target_vector = vec![[0.0; 3]; target_vector.len()];
-                            rotate_vectors_inplace(&precise_rotation_matrix, &target_vector, true, &mut rotated_target_vector, target_vector.len());
-                            let mut target_ra = Vec::new();
-                            let mut target_dec = Vec::new();
-                            for v in rotated_target_vector {
-                                target_ra.push(v[1].atan2(v[0]).to_degrees().rem_euclid(360.0));
-                                target_dec.push(90.0 - v[2].acos().to_degrees());
-                            }
-                            solution.target_ra = Some(target_ra); solution.target_dec = Some(target_dec);
-                        }
-                        if let Some(target_sky) = &options.target_sky_coord {
-                            let mut target_sky_vecs = Vec::with_capacity(target_sky.nrows());
-                            for row in 0..target_sky.nrows() {
-                                let ra_rad = target_sky[[row, 0]].to_radians();
-                                let dec_rad = target_sky[[row, 1]].to_radians();
-                                target_sky_vecs.push([ra_rad.cos() * dec_rad.cos(), ra_rad.sin() * dec_rad.cos(), dec_rad.sin()]);
-                            }
-                            let mut target_sky_vecs_derot = vec![[0.0; 3]; target_sky_vecs.len()];
-                            rotate_vectors_inplace(&precise_rotation_matrix, &target_sky_vecs, false, &mut target_sky_vecs_derot, target_sky_vecs.len());
-                            let mut target_centroids = vec![[0.0; 2]; target_sky_vecs.len()];
-                            let mut kept_sky = Vec::new();
-                            compute_centroids_inplace(&target_sky_vecs_derot, height, width, fov, &mut target_centroids, &mut kept_sky, target_sky_vecs.len());
-                            if let Some(k) = k_final {
-                                for &k_idx in &kept_sky {
-                                    let distorted = distort_centroids(&[target_centroids[k_idx]], height, width, k, 1e-6, 30);
-                                    target_centroids[k_idx] = distorted[0];
-                                }
-                            }
-                            let mut target_y = vec![None; target_sky.nrows()];
-                            let mut target_x = vec![None; target_sky.nrows()];
-                            for &k_idx in &kept_sky {
-                                target_y[k_idx] = Some(target_centroids[k_idx][0]); target_x[k_idx] = Some(target_centroids[k_idx][1]);
-                            }
-                            solution.target_y = Some(target_y); solution.target_x = Some(target_x);
-                        }
-                        if options.return_matches {
-                            let mut m_cents = Vec::new();
-                            let mut m_stars = Vec::new();
-                            let mut m_ids = Vec::new();
-                            for &(img_idx, cat_idx) in &matched_stars {
-                                m_cents.push(image_centroids_undist[img_idx]);
-                                let star_idx = scratch.sp_valid_cat_inds[cat_idx];
-                                let star = &star_table_flat[star_idx];
-                                m_stars.push([star.ra.to_degrees(), star.dec.to_degrees(), star.mag]);
-                                if let Some(ids) = &self.star_catalog_ids { m_ids.push(ids[star_idx]); }
-                            }
-                            solution.matched_centroids = Some(m_cents); solution.matched_stars = Some(m_stars);
-                            if !m_ids.is_empty() { solution.matched_cat_id = Some(m_ids); }
-                        }
-                        if options.return_catalog {
-                            let mut cat_stars = Vec::new();
-                            for c_idx in 0..crop_len {
-                                let star_idx = scratch.sp_valid_cat_inds[c_idx];
-                                let star = &star_table_flat[star_idx];
-                                cat_stars.push((star.ra.to_degrees(), star.dec.to_degrees(), star.mag, scratch.sp_valid_cat_centroids[c_idx][0], scratch.sp_valid_cat_centroids[c_idx][1]));
-                            }
-                            solution.catalog_stars = Some(cat_stars);
-                        }
-                        return solution;
                     }
                 }
             }
