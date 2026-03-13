@@ -561,7 +561,7 @@ fn verify_and_build_solution(
         width * options.match_radius,
     );
 
-    // Probability Calculation
+    // Probability calculation
     let num_star_matches = matched_stars.len();
     let prob_single_star_mismatch = (crop_len as f64) * options.match_radius.powi(2);
     let p_raw = 1.0 - prob_single_star_mismatch;
@@ -617,7 +617,7 @@ fn verify_and_build_solution(
             b_na[m_idx] = r_dist;
         }
 
-        // Pure-Rust SVD Pseudo-Inverse for Distortions
+        // Pure-Rust SVD pseudo-inverse for distortions
         let svd = SVD::new(a_na, true, true);
         if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
             let sol = pseudo_inv * b_na;
@@ -1322,7 +1322,7 @@ impl Tetra3 {
             };
         }
 
-        // Thinning Strategy
+        // Thinning strategy
         let pattern_stars_separation_pixels =
             width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
         let mut keep_for_patterns = vec![false; num_centroids_raw];
@@ -1373,7 +1373,7 @@ impl Tetra3 {
         let image_centroids_vectors =
             compute_vectors_flat(&image_centroids_undist, height, width, fov_initial);
 
-        // OPTIMIZATION: Precompute pairwise distance angles exactly ONCE.
+        // OPTIMIZATION: Precompute pairwise distance angles exactly once.
         // Drops 6 sqrt and 6 asin operations per iteration inside the hot combinatorics loop.
         let num_vecs = image_centroids_vectors.len();
         let mut precomputed_angles = vec![0.0; num_vecs * num_vecs];
@@ -1401,14 +1401,28 @@ impl Tetra3 {
 
         let n_inds = pattern_centroids_inds.len();
 
+        // Fail fast: if spatial thinning leaves us with too few stars to form a single pattern, abort.
+        if n_inds < p_size {
+            return Solution {
+                status: SolveStatus::NoMatch,
+                t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                ..Default::default()
+            };
+        }
+
         // -------------------------------------------------------------
         // HOT PATH: p_size == 4
-        // Allocation-Free Native Iteration mirroring breadth-first order
+        // Allocation-free native iteration mirroring breadth-first order
+        //
+        // The pattern size for databases created by tetra3.py is 4, so we
+        // expect to always hit this path.
         // -------------------------------------------------------------
-        if p_size == 4 && n_inds >= 4 {
+        if p_size == 4 {
             for l in 3..n_inds {
                 // OPTIMIZATION: Moving timeout and cancellation checks here.
-                // Checking Instant::now() is a syscall. Moved out of the absolute deepest loop.
+                // This entire path is extremely fast on current hardware,
+                // completing in well under 1ms. Timeout and cancellation aren't
+                // real possibilities but they're kept here for completeness.
                 if let Some(timeout) = options.solve_timeout_ms {
                     if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
                         return Solution {
