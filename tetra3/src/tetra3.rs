@@ -509,57 +509,112 @@ impl Tetra3 {
             if zf.read_to_end(&mut buf).is_ok() {
                 let mut cursor = Cursor::new(&buf);
                 if NpyFile::new(&mut cursor).is_ok() {
-                    let mut data = vec![0u8; 828];
-                    if cursor.read_exact(&mut data).is_ok() {
-                        let mut hash_type = String::new();
-                        for i in 0..64 {
-                            let offset = 256 + (i * 4);
-                            let c = data[offset];
-                            if c == 0 {
-                                break;
+                    // Read all remaining data after the npy header.
+                    let mut data = Vec::new();
+                    cursor.read_to_end(&mut data).ok();
+                    let record_len = data.len();
+
+                    // Detect database format by record size:
+                    //   828 bytes: has hash_table_type field (<U64, 256 bytes after pattern_mode)
+                    //              and num_patterns (<u4, 4 bytes at end)
+                    //   568 bytes: no hash_table_type, no num_patterns (standard tetra3 database)
+                    //
+                    // The offset of fields after pattern_mode differs by 256 bytes
+                    // (the size of the hash_table_type field).
+                    let base = if record_len >= 828 { 256usize } else { 0usize };
+
+                    if record_len >= 568 {
+                        // hash_table_type (only in 828-byte format, at offset 256)
+                        if base > 0 {
+                            let mut hash_type = String::new();
+                            for i in 0..64 {
+                                let offset = 256 + (i * 4);
+                                let c = data[offset];
+                                if c == 0 {
+                                    break;
+                                }
+                                hash_type.push(c as char);
                             }
-                            hash_type.push(c as char);
-                        }
-                        if hash_type.trim() == "linear_probe" {
-                            linear_probe = true;
+                            if hash_type.trim() == "linear_probe" {
+                                linear_probe = true;
+                            }
+                        } else {
+                            // No hash_table_type field; check pattern_mode for
+                            // "linear_probe" (offset 0, UCS-4 LE, 64 chars).
+                            let mut pattern_mode = String::new();
+                            for i in 0..64 {
+                                let offset = i * 4;
+                                let c = data[offset];
+                                if c == 0 {
+                                    break;
+                                }
+                                pattern_mode.push(c as char);
+                            }
+                            if pattern_mode.trim() == "linear_probe" {
+                                linear_probe = true;
+                            }
                         }
 
-                        let p_size = u16::from_le_bytes([data[512], data[513]]);
+                        let o = 256 + base; // offset of pattern_size
+                        let p_size = u16::from_le_bytes([data[o], data[o + 1]]);
                         db_props.insert("pattern_size".to_string(), p_size as f64);
 
-                        let p_bins = u16::from_le_bytes([data[514], data[515]]);
+                        let p_bins = u16::from_le_bytes([data[o + 2], data[o + 3]]);
                         db_props.insert("pattern_bins".to_string(), p_bins as f64);
 
-                        let p_max_err =
-                            f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
+                        let p_max_err = f32::from_le_bytes([
+                            data[o + 4], data[o + 5], data[o + 6], data[o + 7],
+                        ]);
                         db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
 
-                        let max_fov =
-                            f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
+                        let max_fov = f32::from_le_bytes([
+                            data[o + 8], data[o + 9], data[o + 10], data[o + 11],
+                        ]);
                         db_props.insert("max_fov".to_string(), max_fov as f64);
 
-                        let min_fov =
-                            f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
+                        let min_fov = f32::from_le_bytes([
+                            data[o + 12], data[o + 13], data[o + 14], data[o + 15],
+                        ]);
                         db_props.insert("min_fov".to_string(), min_fov as f64);
 
-                        let eq = u16::from_le_bytes([data[784], data[785]]);
+                        // star_catalog: <U64 = 256 bytes at offset o+16
+                        // epoch_equinox: <u2 at offset o+16+256 = o+272
+                        let e = o + 272;
+                        let eq = u16::from_le_bytes([data[e], data[e + 1]]);
                         db_props.insert("epoch_equinox".to_string(), eq as f64);
 
-                        let pm = f32::from_le_bytes([data[786], data[787], data[788], data[789]]);
+                        let pm = f32::from_le_bytes([
+                            data[e + 2], data[e + 3], data[e + 4], data[e + 5],
+                        ]);
                         db_props.insert("epoch_proper_motion".to_string(), pm as f64);
 
-                        let vs = u16::from_le_bytes([data[800], data[801]]);
-                        db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
+                        // verification_stars_per_fov: <u2 at offset e+16
+                        let vs = u16::from_le_bytes([data[e + 16], data[e + 17]]);
+                        db_props.insert(
+                            "verification_stars_per_fov".to_string(),
+                            vs as f64,
+                        );
 
-                        let presort = data[823] != 0;
+                        // presort_patterns: bool at offset e+33 (568-byte) or e+33 (828-byte)
+                        // From epoch_equinox: +2(eq) +4(pm) +2(lfo) +2(aspf) +2(pspf)
+                        //   +2(pplf) +2(ppas) +2(vspf) +4(smm) +1(sp) +8(rra) +8(rdec) = 39
+                        let presort = data[e + 39] != 0;
                         db_props.insert(
                             "presort_patterns".to_string(),
                             if presort { 1.0 } else { 0.0 },
                         );
 
-                        let extracted_num_patterns =
-                            u32::from_le_bytes([data[824], data[825], data[826], data[827]]);
-                        num_patterns = extracted_num_patterns as usize;
+                        // num_patterns: <u4 at end (828-byte format only)
+                        if record_len >= 828 {
+                            let np_off = e + 40;
+                            let extracted_num_patterns = u32::from_le_bytes([
+                                data[np_off],
+                                data[np_off + 1],
+                                data[np_off + 2],
+                                data[np_off + 3],
+                            ]);
+                            num_patterns = extracted_num_patterns as usize;
+                        }
                     }
                 }
             }
@@ -829,6 +884,22 @@ impl Tetra3 {
             let mut image_pattern_largest_distance = None;
 
             for (_, pattern_key) in pattern_key_list {
+                if let Some(timeout) = options.solve_timeout_ms {
+                    if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
+                        return Solution {
+                            status: SolveStatus::Timeout,
+                            ..Default::default()
+                        };
+                    }
+                }
+                if self.cancelled {
+                    self.cancelled = false;
+                    return Solution {
+                        status: SolveStatus::Cancelled,
+                        ..Default::default()
+                    };
+                }
+
                 let pattern_key_hash = self.compute_pattern_key_hash(&pattern_key, p_bins);
                 let hash_index = self.pattern_key_hash_to_index(
                     pattern_key_hash,
@@ -844,6 +915,22 @@ impl Tetra3 {
                 );
 
                 for (idx, cat_edges) in cat_edges_list.iter().enumerate() {
+                    if let Some(timeout) = options.solve_timeout_ms {
+                        if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
+                            return Solution {
+                                status: SolveStatus::Timeout,
+                                ..Default::default()
+                            };
+                        }
+                    }
+                    if self.cancelled {
+                        self.cancelled = false;
+                        return Solution {
+                            status: SolveStatus::Cancelled,
+                            ..Default::default()
+                        };
+                    }
+
                     let catalog_largest_edge = *cat_edges.last().unwrap();
                     let mut valid = true;
                     for i in 0..(cat_edges.len() - 1) {
