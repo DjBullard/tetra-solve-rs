@@ -5,10 +5,8 @@ edition = "2024"
 
 [dependencies]
 zip = "0.6"
-itertools = "0.11"
 ndarray = "0.17.1"
 npyz = "0.8"
-statrs = "0.16"
 kiddo = "3.0"
 nalgebra = "0.34.1"
 

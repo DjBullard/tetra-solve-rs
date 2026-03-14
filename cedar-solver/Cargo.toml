@@ -9,7 +9,7 @@ path = "src/bin/tetra3_solve_server.rs"
 
 [dependencies]
 zip = "0.6"
-cedar-elements = { path = "../../cedar-server/elements" }
+cedar-elements = { path = "../cedar-server/elements" }
 ndarray = "0.17.1"
 async-trait = "0.1.89"
 canonical-error = "0.1.0"
@@ -31,5 +31,4 @@ prost-build = "0.12.3"
 tonic-build = "0.11"
 
 [dev-dependencies]
-tetra3_server = { path = "../../tetra3_server" }
 tokio = { version = "1.0", features = ["full", "test-util"] }

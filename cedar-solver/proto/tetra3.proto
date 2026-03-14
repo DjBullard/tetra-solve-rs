@@ -1,1 +1,81 @@
-../../../tetra3_server/proto/tetra3.proto
+// Copyright (c) 2026 Omair Kamil oakamil@gmail.com
+// See LICENSE file in root directory for license terms.
+
+syntax = "proto3";
+package tetra3_server;
+
+import "google/protobuf/duration.proto";
+
+message ImageCoord {
+  double x = 1;
+  double y = 2;
+}
+
+message CelestialCoord {
+  double ra = 1;
+  double dec = 2;
+}
+
+message MatchedStar {
+  CelestialCoord celestial_coord = 1;
+  double magnitude = 2;
+  ImageCoord image_coord = 3;
+  optional string cat_id = 4;
+}
+
+message RotationMatrix {
+  repeated double matrix_elements = 1;
+}
+
+enum SolveStatus {
+  UNSPECIFIED = 0;
+  MATCH_FOUND = 1;
+  NO_MATCH = 2;
+  TIMEOUT = 3;
+  CANCELLED = 4;
+  TOO_FEW = 5;
+}
+
+message SolveRequest {
+  repeated ImageCoord star_centroids = 1;
+  int32 image_width = 2;
+  int32 image_height = 3;
+  optional double fov_estimate = 4;
+  optional double fov_max_error = 5;
+  optional double match_radius = 7;
+  optional double match_threshold = 8;
+  repeated ImageCoord target_pixels = 9;
+  optional double distortion = 10;
+  bool return_matches = 11;
+  optional double match_max_error = 12;
+  google.protobuf.Duration solve_timeout = 13;
+  repeated CelestialCoord target_sky_coords = 14;
+  bool return_catalog = 15;
+  bool return_rotation_matrix = 16;
+}
+
+message SolveResult {
+  CelestialCoord image_center_coords = 1;
+  optional double roll = 2;
+  optional double fov = 3;
+  optional double distortion = 4;
+  optional double rmse = 5;
+  optional int32 matches = 6;
+  optional double prob = 7;
+  optional double epoch_equinox = 8;
+  optional double epoch_proper_motion = 9;
+  google.protobuf.Duration solve_time = 10;
+  repeated CelestialCoord target_coords = 12;
+  repeated MatchedStar matched_stars = 13;
+  optional SolveStatus status = 14;
+  repeated ImageCoord target_sky_to_image_coords = 15;
+  repeated ImageCoord pattern_centroids = 16;
+  RotationMatrix rotation_matrix = 17;
+  optional double p90e = 18;
+  optional double maxe = 19;
+  repeated MatchedStar catalog_stars = 20;
+}
+
+service Tetra3 {
+  rpc SolveFromCentroids(SolveRequest) returns (SolveResult);
+}
